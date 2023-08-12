@@ -85,11 +85,11 @@ def all_subclasses(cls) -> Set:
 ca_path = certifi.where()
 
 
-base_units = {'BTC':8, 'mBTC':5, 'bits':2, 'sat':0}
+base_units = {'LTC':8, 'mLTC':5, 'bits':2, 'sat':0}
 base_units_inverse = inv_dict(base_units)
-base_units_list = ['BTC', 'mBTC', 'bits', 'sat']  # list(dict) does not guarantee order
+base_units_list = ['LTC', 'mLTC', 'bits', 'sat']  # list(dict) does not guarantee order
 
-DECIMAL_POINT_DEFAULT = 5  # mBTC
+DECIMAL_POINT_DEFAULT = 5  # mLTC
 
 
 class UnknownBaseUnit(Exception): pass
@@ -623,11 +623,11 @@ def user_dir():
     elif 'ANDROID_DATA' in os.environ:
         return android_data_dir()
     elif os.name == 'posix':
-        return os.path.join(os.environ["HOME"], ".electrum")
+        return os.path.join(os.environ["HOME"], ".electrum-ltc")
     elif "APPDATA" in os.environ:
-        return os.path.join(os.environ["APPDATA"], "Electrum")
+        return os.path.join(os.environ["APPDATA"], "Electrum-LTC")
     elif "LOCALAPPDATA" in os.environ:
-        return os.path.join(os.environ["LOCALAPPDATA"], "Electrum")
+        return os.path.join(os.environ["LOCALAPPDATA"], "Electrum-LTC")
     else:
         #raise Exception("No home directory found in environment variables.")
         return
@@ -882,62 +882,32 @@ def age(
             return _("in over {} years").format(round(distance_in_minutes / 525600))
 
 mainnet_block_explorers = {
-    '3xpl.com': ('https://3xpl.com/bitcoin/',
-                        {'tx': 'transaction/', 'addr': 'address/'}),
-    'Bitupper Explorer': ('https://bitupper.com/en/explorer/bitcoin/',
-                        {'tx': 'transactions/', 'addr': 'addresses/'}),
-    'Bitflyer.jp': ('https://chainflyer.bitflyer.jp/',
-                        {'tx': 'Transaction/', 'addr': 'Address/'}),
-    'Blockchain.info': ('https://blockchain.com/btc/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
-    'blockchainbdgpzk.onion': ('https://blockchainbdgpzk.onion/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
-    'Blockstream.info': ('https://blockstream.info/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
-    'Bitaps.com': ('https://btc.bitaps.com/',
+    'Bitaps.com': ('https://ltc.bitaps.com/',
                         {'tx': '', 'addr': ''}),
-    'BTC.com': ('https://btc.com/',
-                        {'tx': '', 'addr': ''}),
-    'Chain.so': ('https://www.chain.so/',
-                        {'tx': 'tx/BTC/', 'addr': 'address/BTC/'}),
-    'Insight.is': ('https://insight.bitpay.com/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
-    'TradeBlock.com': ('https://tradeblock.com/blockchain/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
-    'BlockCypher.com': ('https://live.blockcypher.com/btc/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
-    'Blockchair.com': ('https://blockchair.com/bitcoin/',
+    'Blockchair.com': ('https://blockchair.com/litecoin/',
                         {'tx': 'transaction/', 'addr': 'address/'}),
-    'blockonomics.co': ('https://www.blockonomics.co/',
-                        {'tx': 'api/tx?txid=', 'addr': '#/search?q='}),
-    'mempool.space': ('https://mempool.space/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
-    'mempool.emzy.de': ('https://mempool.emzy.de/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
-    'OXT.me': ('https://oxt.me/',
+    'Blockchair.com (Tor)': ('http://blkchairbknpn73cfjhevhla7rkp4ed5gg2knctvv7it4lioy22defid.onion/litecoin/',
                         {'tx': 'transaction/', 'addr': 'address/'}),
-    'smartbit.com.au': ('https://www.smartbit.com.au/',
+    'BlockCypher.com': ('https://live.blockcypher.com/ltc/',
                         {'tx': 'tx/', 'addr': 'address/'}),
-    'mynode.local': ('http://mynode.local:3002/',
+    'explorer.litecoin.net': ('http://explorer.litecoin.net/',
                         {'tx': 'tx/', 'addr': 'address/'}),
-    'system default': ('blockchain:/',
+    'LiteCore': ('https://insight.litecore.io/',
+                        {'tx': 'tx/', 'addr': 'address/'}),
+    'SoChain': ('https://chain.so/',
+                        {'tx': 'tx/LTC/', 'addr': 'address/LTC/'}),
+    'system default': ('blockchain://12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2/',
                         {'tx': 'tx/', 'addr': 'address/'}),
 }
 
 testnet_block_explorers = {
-    'Bitaps.com': ('https://tbtc.bitaps.com/',
+    'Bitaps.com': ('https://tltc.bitaps.com/',
                        {'tx': '', 'addr': ''}),
-    'BlockCypher.com': ('https://live.blockcypher.com/btc-testnet/',
+    'LiteCore': ('https://testnet.litecore.io/',
                        {'tx': 'tx/', 'addr': 'address/'}),
-    'Blockchain.info': ('https://www.blockchain.com/btc-testnet/',
-                       {'tx': 'tx/', 'addr': 'address/'}),
-    'Blockstream.info': ('https://blockstream.info/testnet/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
-    'mempool.space': ('https://mempool.space/testnet/',
-                        {'tx': 'tx/', 'addr': 'address/'}),
-    'smartbit.com.au': ('https://testnet.smartbit.com.au/',
-                       {'tx': 'tx/', 'addr': 'address/'}),
-    'system default': ('blockchain://000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943/',
+    'SoChain': ('https://chain.so/',
+                        {'tx': 'tx/LTCTEST/', 'addr': 'address/LTCTEST/'}),
+    'system default': ('blockchain://4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0/',
                        {'tx': 'tx/', 'addr': 'address/'}),
 }
 

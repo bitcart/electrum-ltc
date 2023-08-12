@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 COINBASE_MATURITY = 100
 COIN = 100000000
-TOTAL_COIN_SUPPLY_LIMIT_IN_BTC = 21000000
+TOTAL_COIN_SUPPLY_LIMIT_IN_BTC = 84000000
 
 NLOCKTIME_MIN = 0
 NLOCKTIME_BLOCKHEIGHT_MAX = 500_000_000 - 1
@@ -453,7 +453,7 @@ def script_to_address(script: str, *, net=None) -> Optional[str]:
 def address_to_script(addr: str, *, net=None) -> str:
     if net is None: net = constants.net
     if not is_address(addr, net=net):
-        raise BitcoinException(f"invalid bitcoin address: {addr}")
+        raise BitcoinException(f"invalid litecoin address: {addr}")
     witver, witprog = segwit_addr.decode_segwit_address(net.SEGWIT_HRP, addr)
     if witprog is not None:
         if not (0 <= witver <= 16):
@@ -619,10 +619,10 @@ def DecodeBase58Check(psz: Union[bytes, str]) -> bytes:
 # extended WIF for segwit (used in 3.0.x; but still used internally)
 # the keys in this dict should be a superset of what Imported Wallets can import
 WIF_SCRIPT_TYPES = {
-    'p2pkh':0,
+    'p2pkh':48,
     'p2wpkh':1,
     'p2wpkh-p2sh':2,
-    'p2sh':5,
+    'p2sh':50,
     'p2wsh':6,
     'p2wsh-p2sh':7
 }
@@ -640,7 +640,7 @@ def serialize_privkey(secret: bytes, compressed: bool, txin_type: str, *,
     if internal_use:
         prefix = bytes([(WIF_SCRIPT_TYPES[txin_type] + constants.net.WIF_PREFIX) & 255])
     else:
-        prefix = bytes([constants.net.WIF_PREFIX])
+        prefix = bytes([(WIF_SCRIPT_TYPES['p2pkh'] + constants.net.WIF_PREFIX) & 255])
     suffix = b'\01' if compressed else b''
     vchIn = prefix + secret + suffix
     base58_wif = EncodeBase58Check(vchIn)
@@ -674,7 +674,7 @@ def deserialize_privkey(key: str) -> Tuple[str, bytes, bool]:
             raise BitcoinException('invalid prefix ({}) for WIF key (1)'.format(vch[0])) from None
     else:
         # all other keys must have a fixed first byte
-        if vch[0] != constants.net.WIF_PREFIX:
+        if vch[0] != (WIF_SCRIPT_TYPES['p2pkh'] + constants.net.WIF_PREFIX) & 255:
             raise BitcoinException('invalid prefix ({}) for WIF key (2)'.format(vch[0]))
 
     if len(vch) not in [33, 34]:
