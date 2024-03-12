@@ -191,6 +191,7 @@ class SPV(NetworkJobOnDefaultServer):
         self.requested_merkle.discard(tx_hash)
 
     def is_up_to_date(self):
+        print("VERIFIER sync", self.requested_merkle, self.wallet.unverified_tx)
         return (not self.requested_merkle
                 and not self.wallet.unverified_tx)
 
