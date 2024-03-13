@@ -151,7 +151,6 @@ class Synchronizer(SynchronizerBase):
         return self.adb.diagnostic_name()
 
     def is_up_to_date(self):
-        print("SYNCHRONIZER IS UP TO DATE", self._init_done, self._adding_addrs, self.requested_addrs, self._handling_addr_statuses, self.requested_histories, self.requested_tx, self._stale_histories, self.status_queue.empty())
         return (self._init_done
                 and not self._adding_addrs
                 and not self.requested_addrs
