@@ -11,6 +11,7 @@ ElDialog {
     id: rootItem
 
     title: qsTr('Proxy settings')
+    iconSource: Qt.resolvedUrl('../../icons/status_connected_proxy.png')
 
     width: parent.width
     height: parent.height
@@ -36,12 +37,7 @@ ElDialog {
             text: qsTr('Ok')
             icon.source: '../../icons/confirmed.png'
             onClicked: {
-                var proxy = proxyconfig.toProxyDict()
-                if (proxy && proxy['enabled'] == true) {
-                    Network.proxy = proxy
-                } else {
-                    Network.proxy = {'enabled': false}
-                }
+                Network.proxy = proxyconfig.toProxyDict()
                 rootItem.close()
             }
         }
@@ -51,17 +47,13 @@ ElDialog {
     Component.onCompleted: {
         var p = Network.proxy
 
-        if ('mode' in p) {
-            proxyconfig.proxy_enabled = true
-            proxyconfig.proxy_address = p['host']
-            proxyconfig.proxy_port = p['port']
-            proxyconfig.username = p['user']
-            proxyconfig.password = p['password']
-            proxyconfig.proxy_type = proxyconfig.proxy_type_map.map(function(x) {
-                return x.value
-            }).indexOf(p['mode'])
-        } else {
-            proxyconfig.proxy_enabled = false
-        }
+        proxyconfig.proxy_enabled = p['enabled']
+        proxyconfig.proxy_address = p['host']
+        proxyconfig.proxy_port = p['port']
+        proxyconfig.username = p['user']
+        proxyconfig.password = p['password']
+        proxyconfig.proxy_type = proxyconfig.proxy_type_map.map(function(x) {
+            return x.value
+        }).indexOf(p['mode'])
     }
 }

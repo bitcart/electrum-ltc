@@ -2,19 +2,19 @@ import threading
 from functools import partial
 from typing import TYPE_CHECKING
 
-from PyQt5.QtCore import Qt, QMetaObject, Q_RETURN_ARG, pyqtSlot, pyqtSignal
-from PyQt5.QtWidgets import QLabel, QVBoxLayout, QLineEdit, QHBoxLayout
+from PyQt6.QtCore import Qt, QMetaObject, Q_RETURN_ARG, pyqtSlot, pyqtSignal
+from PyQt6.QtWidgets import QLabel, QVBoxLayout, QLineEdit, QHBoxLayout
 
 from electrum.i18n import _
 from electrum.plugin import hook
 from electrum.util import UserCancelled, UserFacingException
 
 from .bitbox02 import BitBox02Plugin
-from ..hw_wallet.qt import QtHandlerBase, QtPluginBase
-from ..hw_wallet.plugin import only_hook_if_libraries_available, OperationCancelled
+from electrum.hw_wallet.qt import QtHandlerBase, QtPluginBase
+from electrum.hw_wallet.plugin import only_hook_if_libraries_available, OperationCancelled
 
 from electrum.gui.qt.wizard.wallet import WCScriptAndDerivation, WCHWUnlock, WCHWUninitialized, WCHWXPub
-from electrum.gui.qt.util import WindowModalDialog, OkButton, ButtonsTextEdit
+from electrum.gui.qt.util import WindowModalDialog, OkButton, ButtonsTextEdit, read_QIcon
 
 if TYPE_CHECKING:
     from electrum.gui.qt.wizard.wallet import QENewWalletWizard
@@ -30,19 +30,13 @@ class Plugin(BitBox02Plugin, QtPluginBase):
     @only_hook_if_libraries_available
     @hook
     def receive_menu(self, menu, addrs, wallet):
-        # Context menu on each address in the Addresses Tab, right click...
-        if len(addrs) != 1:
-            return
-        for keystore in wallet.get_keystores():
-            if type(keystore) == self.keystore_class:
+        if len(addrs) == 1:
+            self._add_menu_action(menu, addrs[0], wallet)
 
-                def show_address(keystore=keystore):
-                    keystore.thread.add(
-                        partial(self.show_address, wallet, addrs[0], keystore=keystore)
-                    )
-
-                device_name = "{} ({})".format(self.device, keystore.label)
-                menu.addAction(_("Show on {}").format(device_name), show_address)
+    @only_hook_if_libraries_available
+    @hook
+    def transaction_dialog_address_menu(self, menu, addr, wallet):
+        self._add_menu_action(menu, addr, wallet)
 
     @only_hook_if_libraries_available
     @hook
@@ -58,7 +52,7 @@ class Plugin(BitBox02Plugin, QtPluginBase):
             )
 
         device_name = "{} ({})".format(self.device, keystore.label)
-        mpk_text.addButton("eye1.png", on_button_click, _("Show on {}").format(device_name))
+        mpk_text.addButton(read_QIcon("eye1.png"), on_button_click, _("Show on {}").format(device_name))
 
     @hook
     def init_wallet_wizard(self, wizard: 'QENewWalletWizard'):
@@ -83,7 +77,7 @@ class BitBox02_Handler(QtHandlerBase):
         super(BitBox02_Handler, self).__init__(win, "BitBox02")
 
     def name_multisig_account(self):
-        return QMetaObject.invokeMethod(self, "_name_multisig_account", Qt.BlockingQueuedConnection, Q_RETURN_ARG(str))
+        return QMetaObject.invokeMethod(self, "_name_multisig_account", Qt.ConnectionType.BlockingQueuedConnection, Q_RETURN_ARG(str))
 
     @pyqtSlot(result=str)
     def _name_multisig_account(self):
@@ -109,7 +103,7 @@ class BitBox02_Handler(QtHandlerBase):
         vbox.addLayout(he)
         vbox.addLayout(hlb)
         dialog.setLayout(vbox)
-        dialog.exec_()
+        dialog.exec()
         return name.text().strip()
 
 
@@ -122,7 +116,8 @@ class WCBitbox02ScriptAndDerivation(WCScriptAndDerivation):
 
     def on_ready(self):
         super().on_ready()
-        _name, _info = self.wizard_data['hardware_device']
+        current_cosigner = self.wizard.current_cosigner(self.wizard_data)
+        _name, _info = current_cosigner['hardware_device']
         plugin = self.wizard.plugins.get_plugin(_info.plugin_name)
 
         device_id = _info.device.id_
@@ -149,6 +144,7 @@ class WCBitbox02ScriptAndDerivation(WCScriptAndDerivation):
                 self.error = str(e)
             except Exception as e:
                 self.error = repr(e)
+                self.logger.exception(repr(e))
             finally:
                 self.busy = False
 

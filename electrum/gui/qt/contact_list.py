@@ -26,14 +26,15 @@
 import enum
 from typing import TYPE_CHECKING
 
-from PyQt5.QtGui import QStandardItemModel, QStandardItem
-from PyQt5.QtCore import Qt, QPersistentModelIndex, QModelIndex
-from PyQt5.QtWidgets import (QAbstractItemView, QMenu)
+from PyQt6.QtGui import QStandardItemModel, QStandardItem
+from PyQt6.QtCore import Qt, QPersistentModelIndex, QModelIndex
+from PyQt6.QtWidgets import (QAbstractItemView, QMenu)
 
 from electrum.i18n import _
 from electrum.bitcoin import is_address
 from electrum.util import block_explorer_URL
 from electrum.plugin import run_hook
+from electrum.gui.qt.util import read_QIcon
 
 from .util import webopen
 from .my_treeview import MyTreeView
@@ -54,7 +55,7 @@ class ContactList(MyTreeView):
     }
     filter_columns = [Columns.NAME, Columns.ADDRESS]
 
-    ROLE_CONTACT_KEY = Qt.UserRole + 1000
+    ROLE_CONTACT_KEY = Qt.ItemDataRole.UserRole + 1000
     key_role = ROLE_CONTACT_KEY
 
     def __init__(self, main_window: 'ElectrumWindow'):
@@ -64,7 +65,7 @@ class ContactList(MyTreeView):
             editable_columns=[self.Columns.NAME],
         )
         self.setModel(QStandardItemModel(self))
-        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setSortingEnabled(True)
         self.std_model = self.model()
         self.update()
@@ -100,7 +101,7 @@ class ContactList(MyTreeView):
                 menu.addAction(_("View on block explorer"), lambda: [webopen(u) for u in URLs])
 
         run_hook('create_contact_menu', menu, selected_keys)
-        menu.exec_(self.viewport().mapToGlobal(position))
+        menu.exec(self.viewport().mapToGlobal(position))
 
     def update(self):
         if self.maybe_defer_update():
@@ -118,6 +119,9 @@ class ContactList(MyTreeView):
             items[self.Columns.NAME].setEditable(contact_type != 'openalias')
             items[self.Columns.ADDRESS].setEditable(False)
             items[self.Columns.NAME].setData(key, self.ROLE_CONTACT_KEY)
+            items[self.Columns.NAME].setIcon(
+                read_QIcon("lightning" if contact_type == 'lnaddress' else "bitcoin")
+            )
             row_count = self.model().rowCount()
             self.model().insertRow(row_count, items)
             if key == current_key:
@@ -125,7 +129,7 @@ class ContactList(MyTreeView):
                 set_current = QPersistentModelIndex(idx)
         self.set_current_idx(set_current)
         # FIXME refresh loses sort order; so set "default" here:
-        self.sortByColumn(self.Columns.NAME, Qt.AscendingOrder)
+        self.sortByColumn(self.Columns.NAME, Qt.SortOrder.AscendingOrder)
         self.filter()
         run_hook('update_contacts_tab', self)
 

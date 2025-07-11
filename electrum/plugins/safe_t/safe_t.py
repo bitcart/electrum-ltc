@@ -9,8 +9,8 @@ from electrum.plugin import Device, runs_in_hwd_thread
 from electrum.transaction import Transaction, PartialTransaction, PartialTxInput, Sighash
 from electrum.keystore import Hardware_KeyStore
 
-from ..hw_wallet import HW_PluginBase
-from ..hw_wallet.plugin import is_any_tx_output_on_change_branch, trezor_validate_op_return_output_and_get_data
+from electrum.hw_wallet import HW_PluginBase
+from electrum.hw_wallet.plugin import is_any_tx_output_on_change_branch, trezor_validate_op_return_output_and_get_data
 
 if TYPE_CHECKING:
     from .client import SafeTClient
@@ -236,8 +236,8 @@ class SafeTPlugin(HW_PluginBase):
         outputs = self.tx_outputs(tx, keystore=keystore)
         signatures = client.sign_tx(self.get_coin_name(), inputs, outputs,
                                     lock_time=tx.locktime, version=tx.version)[0]
-        sighash = Sighash.to_sigbytes(Sighash.ALL).hex()
-        signatures = [(x.hex() + sighash) for x in signatures]
+        sighash = Sighash.to_sigbytes(Sighash.ALL)
+        signatures = [(sig + sighash) for sig in signatures]
         tx.update_signatures(signatures)
 
     @runs_in_hwd_thread

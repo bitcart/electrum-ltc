@@ -6,8 +6,9 @@
 # - assumes all keys are available, and signs everything
 # This script, for other builders:
 # - builds all reproducible binaries,
-# - downloads binaries built by the release manager (from airlock), compares and signs them,
-# - and then uploads sigs
+# - downloads binaries built by the release manager (from airlock if SFTPUSER, else from website),
+#   compares and signs them,
+# - and then uploads sigs (if SFTPUSER), else they can be submitted as PR to spesmilo/electrum-signatures
 # Note: the .dmg should be built separately beforehand and copied into dist/
 #       (as it is built on a separate machine)
 #
@@ -57,7 +58,6 @@ if [ -z "$GPGUSER" ]; then
     fail "usage: $0 gpg_username"
 fi
 
-export SSHUSER="$GPGUSER"
 RELEASEMANAGER=""
 if [ "$GPGUSER" == "ThomasV" ]; then
     PUBKEY="--local-user 6694D8DE7BE8EE5631BED9502BD5824B7F9470E6"
@@ -66,6 +66,10 @@ if [ "$GPGUSER" == "ThomasV" ]; then
 elif [ "$GPGUSER" == "sombernight_releasekey" ]; then
     PUBKEY="--local-user 0EEDCFD5CAFB459067349B23CA9EEEC43DF911DC"
     export SSHUSER=sombernight
+else
+    warn "unexpected GPGUSER=$GPGUSER"
+    PUBKEY=""
+    export SSHUSER=""
 fi
 
 
@@ -80,9 +84,7 @@ fi
 
 
 VERSION=$("$CONTRIB"/print_electrum_version.py)
-APK_VERSION=$("$CONTRIB"/print_electrum_version.py APK_VERSION)
 info "VERSION: $VERSION"
-info "APK_VERSION: $APK_VERSION"
 REV=$(git describe --tags)
 info "REV: $REV"
 COMMIT=$(git rev-parse HEAD)
@@ -147,13 +149,13 @@ else
 fi
 
 # android
-apk1="Electrum-$APK_VERSION-armeabi-v7a-release.apk"
-apk2="Electrum-$APK_VERSION-arm64-v8a-release.apk"
-apk3="Electrum-$APK_VERSION-x86_64-release.apk"
+apk1="Electrum-$VERSION-armeabi-v7a-release.apk"
+apk2="Electrum-$VERSION-arm64-v8a-release.apk"
+apk3="Electrum-$VERSION-x86_64-release.apk"
 for arch in armeabi-v7a arm64-v8a x86_64
 do
-    apk="Electrum-$APK_VERSION-$arch-release.apk"
-    apk_unsigned="Electrum-$APK_VERSION-$arch-release-unsigned.apk"
+    apk="Electrum-$VERSION-$arch-release.apk"
+    apk_unsigned="Electrum-$VERSION-$arch-release-unsigned.apk"
     if test -f "dist/$apk"; then
         info "file exists: $apk"
     else
@@ -208,13 +210,41 @@ if [ -z "$RELEASEMANAGER" ] ; then
     rm -rf "$PROJECT_ROOT/dist/releasemanager"
     mkdir --parent "$PROJECT_ROOT/dist/releasemanager"
     cd "$PROJECT_ROOT/dist/releasemanager"
-    # TODO check somehow that RM had finished uploading
-    sftp -oBatchMode=no -b - "$SSHUSER@uploadserver" << !
-       cd electrum-downloads-airlock
-       cd "$VERSION"
-       mget *
-       bye
-!
+
+    if [ -z "$SSHUSER" ]; then
+        info "No SFTP access, downloading binaries from website"
+        BASE_URL="https://download.electrum.org/$VERSION"
+        FILES_TO_DOWNLOAD=(
+            "$tarball"
+            "$srctarball"
+            "$appimage"
+            "$win1"
+            "$win2"
+            "$win3"
+            "$apk1"
+            "$apk2"
+            "$apk3"
+            "$dmg"
+        )
+
+        for filename in "${FILES_TO_DOWNLOAD[@]}"; do
+            if [ ! -f "$filename" ]; then
+                info "Downloading $filename..."
+                wget -q "$BASE_URL/$filename" -O "$filename" || fail "Failed to download $filename"
+            else
+                info "File already exists: $filename"
+            fi
+        done
+    else
+        # TODO check somehow that RM had finished uploading
+        sftp -oBatchMode=no -b - "$SSHUSER@uploadserver" <<-EOF
+           cd electrum-downloads-airlock
+           cd "$VERSION"
+           mget *
+           bye
+EOF
+    fi
+
     # check we have each binary
     test -f "$tarball"    || fail "tarball not found among sftp downloads"
     test -f "$srctarball" || fail "srctarball not found among sftp downloads"
@@ -254,8 +284,14 @@ if [ -z "$RELEASEMANAGER" ] ; then
         signame="$fname.$GPGUSER.asc"
         gpg --sign --armor --detach $PUBKEY --output "$PROJECT_ROOT/dist/sigs/$signame" "$fname"
     done
-    # upload sigs
-    ELECBUILD_UPLOADFROM="$PROJECT_ROOT/dist/sigs/" "$CONTRIB/upload.sh"
+
+    if [ -z "$SSHUSER" ]; then
+        info "Signing successfully, now open a pull request with your signatures to spesmilo/electrum-signatures"
+        exit 0
+    else
+        # upload sigs
+        ELECBUILD_UPLOADFROM="$PROJECT_ROOT/dist/sigs/" "$CONTRIB/upload.sh"
+    fi
 
 else
     # ONLY release manager
@@ -283,6 +319,7 @@ else
 
 fi
 
+set +x
 
 info "release.sh finished successfully."
 info "After two people ran release.sh, the binaries will be publicly available on uploadserver."

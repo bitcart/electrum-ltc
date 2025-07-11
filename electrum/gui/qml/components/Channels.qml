@@ -125,7 +125,8 @@ Pane {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 1
                 text: qsTr('Swap');
-                enabled: Daemon.currentWallet.lightningCanSend.satsInt > 0 || Daemon.currentWallet.lightningCanReceive.satInt > 0
+                enabled: Daemon.currentWallet.lightningCanSend.satsInt > 0 ||
+                    (Daemon.currentWallet.lightningCanReceive.satsInt > 0 && Daemon.currentWallet.confirmedBalance.satsInt > 0)
                 icon.source: Qt.resolvedUrl('../../icons/update.png')
                 onClicked: app.startSwap()
             }
@@ -133,7 +134,7 @@ Pane {
             FlatButton {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 1
-                enabled: Daemon.currentWallet.confirmedBalance.satsInt > 0
+                enabled: Daemon.currentWallet.canHaveLightning && Daemon.currentWallet.confirmedBalance.satsInt > 0
                 text: qsTr('Open Channel')
                 onClicked: {
                     if (Daemon.currentWallet.channelModel.count == 0) {

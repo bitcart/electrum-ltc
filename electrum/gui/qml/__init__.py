@@ -20,15 +20,15 @@ except Exception as e:
         "Error: Could not import PyQt6.QtQml. On Linux systems, "
         "you may try 'sudo apt-get install python3-pyqt6.qtquick'") from e
 
-from PyQt6.QtCore import (Qt, QCoreApplication, QLocale, QTranslator, QTimer, QT_VERSION_STR, PYQT_VERSION_STR)
+from PyQt6.QtCore import (Qt, QCoreApplication, QLocale, QTimer, QT_VERSION_STR, PYQT_VERSION_STR)
 from PyQt6.QtGui import QGuiApplication
-sys._GUI_QT_VERSION = 6  # used by gui/common_qt
 
-from electrum.i18n import _
 from electrum.plugin import run_hook
 from electrum.util import profiler
 from electrum.logging import Logger
 from electrum.gui import BaseElectrumGui
+from electrum.gui.common_qt.i18n import ElectrumTranslator
+
 
 if TYPE_CHECKING:
     from electrum.daemon import Daemon
@@ -36,14 +36,6 @@ if TYPE_CHECKING:
     from electrum.plugin import Plugins
 
 from .qeapp import ElectrumQmlApplication, Exception_Hook
-
-
-class ElectrumTranslator(QTranslator):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
-    def translate(self, context, source_text, disambiguation, n):
-        return _(source_text, context=context)
 
 
 class ElectrumGui(BaseElectrumGui, Logger):
@@ -73,7 +65,7 @@ class ElectrumGui(BaseElectrumGui, Logger):
         if hasattr(Qt, "AA_ShareOpenGLContexts"):
             QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
         if hasattr(QGuiApplication, 'setDesktopFileName'):
-            QGuiApplication.setDesktopFileName('electrum.desktop')
+            QGuiApplication.setDesktopFileName('electrum')
 
         if "QT_QUICK_CONTROLS_STYLE" not in os.environ:
             os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
@@ -90,7 +82,7 @@ class ElectrumGui(BaseElectrumGui, Logger):
         self.timer.timeout.connect(lambda: None)  # periodically enter python scope
 
         # hook for crash reporter
-        Exception_Hook.maybe_setup(config=config, slot=self.app.appController.crash)
+        Exception_Hook.maybe_setup(slot=self.app.appController.crash)
 
         # Initialize any QML plugins
         run_hook('init_qml', self.app)

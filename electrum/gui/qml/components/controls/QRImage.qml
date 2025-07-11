@@ -15,7 +15,7 @@ Item {
 
     Rectangle {
         id: r
-        width: _qrprops.modules * _qrprops.box_size
+        width: _qrprops.qr_pixelsize
         height: width
         color: 'white'
     }
@@ -24,13 +24,13 @@ Item {
         source: qrdata && render ? 'image://qrgen/' + qrdata : ''
         visible: !isTextState
 
-        Rectangle {
+        Rectangle {  // container for logo inside qr code
             visible: root.render && _qrprops.valid
             color: 'white'
             x: (parent.width - width) / 2
             y: (parent.height - height) / 2
-            width: _qrprops.icon_modules * _qrprops.box_size
-            height: _qrprops.icon_modules * _qrprops.box_size
+            width: _qrprops.icon_pixelsize
+            height: _qrprops.icon_pixelsize
 
             Image {
                 visible: _qrprops.valid
@@ -75,4 +75,14 @@ Item {
         }
     }
 
+    onVisibleChanged: {
+        if (root.visible) {
+            // set max brightness to make qr code easier to scan
+            if (AppController.isMaxBrightnessOnQrDisplayEnabled()) {
+                AppController.setMaxScreenBrightness()
+            }
+        } else {
+            AppController.resetScreenBrightness()
+        }
+    }
 }

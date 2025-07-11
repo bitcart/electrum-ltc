@@ -20,7 +20,7 @@ if [[ -n "$3" \
 	  && ( "$1" == "qml" ) \
 	  && ( "$2" == "all"  || "$2" == "armeabi-v7a" || "$2" == "arm64-v8a" || "$2" == "x86" || "$2" == "x86_64" ) \
 	  && ( "$3" == "debug"  || "$3" == "release" || "$3" == "release-unsigned" ) ]] ; then
-    info "arguments $*"
+    info "arguments $1 $2 $3"
 else
     fail "usage: build.sh <qml|...> <arm64-v8a|armeabi-v7a|x86|x86_64|all> <debug|release|release-unsigned>"
     exit 1
@@ -51,7 +51,7 @@ docker build \
 # maybe do fresh clone
 if [ ! -z "$ELECBUILD_COMMIT" ] ; then
     info "ELECBUILD_COMMIT=$ELECBUILD_COMMIT. doing fresh clone and git checkout."
-    FRESH_CLONE="/tmp/electrum_build/android/fresh_clone/electrum"
+    FRESH_CLONE=${FRESH_CLONE:-"/tmp/electrum_build/android/fresh_clone/electrum"}
     rm -rf "$FRESH_CLONE" 2>/dev/null || ( info "we need sudo to rm prev FRESH_CLONE." && sudo rm -rf "$FRESH_CLONE" )
     umask 0022
     git clone "$PROJECT_ROOT" "$FRESH_CLONE"

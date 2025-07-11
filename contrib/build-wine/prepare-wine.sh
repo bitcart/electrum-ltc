@@ -1,10 +1,10 @@
 #!/bin/bash
 
 PYINSTALLER_REPO="https://github.com/pyinstaller/pyinstaller.git"
-PYINSTALLER_COMMIT="413cce49ff28d87fad4472f4953489226ec90c84"
-# ^ tag "v5.11.0"
+PYINSTALLER_COMMIT="306d4d92580fea7be7ff2c89ba112cdc6f73fac1"
+# ^ tag "v6.13.0"
 
-PYTHON_VERSION=3.10.11
+PYTHON_VERSION=3.12.10
 
 
 # Let's begin!
@@ -35,7 +35,7 @@ else
 fi
 PYTHON_DOWNLOADS="$CACHEDIR/python$PYTHON_VERSION"
 mkdir -p "$PYTHON_DOWNLOADS"
-for msifile in core dev exe lib pip tools; do
+for msifile in core dev exe lib pip; do
     echo "Installing $msifile..."
     download_if_not_exist "$PYTHON_DOWNLOADS/${msifile}.msi" "https://www.python.org/ftp/python/$PYTHON_VERSION/$PYARCH/${msifile}.msi"
     download_if_not_exist "$PYTHON_DOWNLOADS/${msifile}.msi.asc" "https://www.python.org/ftp/python/$PYTHON_VERSION/$PYARCH/${msifile}.msi.asc"

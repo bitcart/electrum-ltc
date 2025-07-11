@@ -5,8 +5,10 @@ from PyQt6.QtCore import Qt, QAbstractListModel, QModelIndex
 
 from electrum.logging import get_logger
 from electrum.util import Satoshis
+from .qeconfig import QEConfig
 
 from .qetypes import QEAmount
+from .util import qt_event_listener, QtEventListener
 
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
@@ -102,7 +104,7 @@ class QEAddressCoinFilterProxyModel(QSortFilterProxyModel):
             self.filterTextChanged.emit()
 
 
-class QEAddressCoinListModel(QAbstractListModel):
+class QEAddressCoinListModel(QAbstractListModel, QtEventListener):
     _logger = get_logger(__name__)
 
     # define listmodel rolemap
@@ -118,8 +120,21 @@ class QEAddressCoinListModel(QAbstractListModel):
         self._items = []
         self._filterModel = None
 
+        self.register_callbacks()
+        self.destroyed.connect(lambda: self.on_destroy())
+
+        QEConfig.instance.freezeReusedAddressUtxosChanged.connect(lambda: self.setDirty())
+
         self._dirty = True
         self.initModel()
+
+    def on_destroy(self):
+        self.unregister_callbacks()
+
+    @qt_event_listener
+    def on_event_labels_received(self, wallet, labels):
+        if wallet == self.wallet:
+            self.setDirty()
 
     def rowCount(self, index):
         return len(self._items)
@@ -185,8 +200,9 @@ class QEAddressCoinListModel(QAbstractListModel):
 
     # initial model data
     @pyqtSlot()
-    def initModel(self):
-        if not self._dirty:
+    @pyqtSlot(bool)
+    def initModel(self, force: bool = False):
+        if not self._dirty and not force:
             return
 
         r_addresses = self.wallet.get_receiving_addresses()

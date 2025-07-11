@@ -27,9 +27,9 @@ from typing import Optional, List, Dict, Sequence, Set, TYPE_CHECKING
 import enum
 import copy
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QStandardItemModel, QStandardItem, QFont
-from PyQt5.QtWidgets import QAbstractItemView, QMenu, QLabel, QHBoxLayout
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QStandardItemModel, QStandardItem, QFont
+from PyQt6.QtWidgets import QAbstractItemView, QMenu
 
 from electrum.i18n import _
 from electrum.bitcoin import is_address
@@ -37,8 +37,8 @@ from electrum.transaction import PartialTxInput, PartialTxOutput
 from electrum.lnutil import MIN_FUNDING_SAT
 from electrum.util import profiler
 
-from .util import ColorScheme, MONOSPACE_FONT, EnterButton
-from .my_treeview import MyTreeView
+from .util import ColorScheme, MONOSPACE_FONT
+from .my_treeview import MyTreeView, MySortModel
 from .new_channel_dialog import NewChannelDialog
 from ..messages import MSG_FREEZE_ADDRESS, MSG_FREEZE_COIN
 
@@ -67,7 +67,8 @@ class UTXOList(MyTreeView):
     filter_columns = [Columns.ADDRESS, Columns.LABEL, Columns.OUTPOINT]
     stretch_column = Columns.LABEL
 
-    ROLE_PREVOUT_STR = Qt.UserRole + 1000
+    ROLE_PREVOUT_STR = Qt.ItemDataRole.UserRole + 1000
+    ROLE_SORT_ORDER = Qt.ItemDataRole.UserRole + 1001
     key_role = ROLE_PREVOUT_STR
 
     def __init__(self, main_window: 'ElectrumWindow'):
@@ -79,24 +80,31 @@ class UTXOList(MyTreeView):
         self._utxo_dict = {}
         self.wallet = self.main_window.wallet
         self.std_model = QStandardItemModel(self)
-        self.setModel(self.std_model)
-        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.proxy = MySortModel(self, sort_role=self.ROLE_SORT_ORDER)
+        self.proxy.setSourceModel(self.std_model)
+        self.setModel(self.proxy)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setSortingEnabled(True)
 
     def create_toolbar(self, config):
         toolbar, menu = self.create_toolbar_with_menu('')
         self.num_coins_label = toolbar.itemAt(0).widget()
         menu.addAction(_('Coin control'), lambda: self.add_selection_to_coincontrol())
+
+        def cb():
+            self.main_window.utxo_list.refresh_all()  # for coin frozen status
+            self.main_window.update_status()  # frozen balance
+        menu.addConfig(config.cv.WALLET_FREEZE_REUSED_ADDRESS_UTXOS, callback=cb)
         return toolbar
 
     @profiler(min_threshold=0.05)
     def update(self):
         # not calling maybe_defer_update() as it interferes with coincontrol status bar
+        self.proxy.setDynamicSortFilter(False)  # temp. disable re-sorting after every change
         utxos = self.wallet.get_utxos()
-        utxos.sort(key=lambda x: x.block_height, reverse=True)
         self._maybe_reset_coincontrol(utxos)
         self._utxo_dict = {}
-        self.model().clear()
+        self.std_model.clear()
         self.update_headers(self.__class__.headers)
         for idx, utxo in enumerate(utxos):
             name = utxo.prevout.to_str()
@@ -117,9 +125,11 @@ class UTXOList(MyTreeView):
             utxo_item[self.Columns.AMOUNT].setFont(QFont(MONOSPACE_FONT))
             utxo_item[self.Columns.PARENTS].setFont(QFont(MONOSPACE_FONT))
             utxo_item[self.Columns.OUTPOINT].setFont(QFont(MONOSPACE_FONT))
-            self.model().insertRow(idx, utxo_item)
+            self.std_model.insertRow(idx, utxo_item)
             self.refresh_row(name, idx)
         self.filter()
+        self.proxy.setDynamicSortFilter(True)
+        self.sortByColumn(self.Columns.OUTPOINT, Qt.SortOrder.DescendingOrder)
         self.update_coincontrol_bar()
         self.num_coins_label.setText(_('{} unspent transaction outputs').format(len(utxos)))
 
@@ -144,6 +154,11 @@ class UTXOList(MyTreeView):
         utxo_item[self.Columns.PARENTS].setText('%6s'%num_parents if num_parents else '-')
         label = self.wallet.get_label_for_txid(txid) or ''
         utxo_item[self.Columns.LABEL].setText(label)
+        sort_key = (
+            self.wallet.adb.tx_height_to_sort_height(utxo.block_height),  # sort by block height
+            str(utxo.short_id),                                           # order inside block (if mined), or just txid
+        )
+        utxo_item[self.Columns.OUTPOINT].setData(sort_key, self.ROLE_SORT_ORDER)
         SELECTED_TO_SPEND_TOOLTIP = _('Coin selected to be spent')
         if key in self._spend_set:
             tooltip = key + "\n" + SELECTED_TO_SPEND_TOOLTIP
@@ -227,7 +242,10 @@ class UTXOList(MyTreeView):
             return False
         value = sum(x.value_sats() for x in coins)
         min_amount = self.wallet.lnworker.swap_manager.get_min_amount()
-        max_amount = self.wallet.lnworker.swap_manager.max_amount_forward_swap()
+        max_amount = self.wallet.lnworker.swap_manager.client_max_amount_forward_swap()
+        if min_amount is None or max_amount is None:
+            # we need to fetch data from swap server
+            return True
         if value < min_amount:
             return False
         if max_amount is None or value > max_amount:
@@ -349,7 +367,7 @@ class UTXOList(MyTreeView):
                 act = menu_freeze.addAction(_("Unfreeze Addresses"), lambda: self.main_window.set_frozen_state_of_addresses(addrs, False))
                 act.setToolTip(MSG_FREEZE_ADDRESS)
 
-        menu.exec_(self.viewport().mapToGlobal(position))
+        menu.exec(self.viewport().mapToGlobal(position))
 
     def get_filter_data_from_coordinate(self, row, col):
         if col == self.Columns.OUTPOINT:

@@ -81,6 +81,11 @@ class QETransactionListModel(QAbstractListModel, QtEventListener):
             roles = [self._ROLE_RMAP['date']]
             self.dataChanged.emit(index, index, roles)
 
+    @qt_event_listener
+    def on_event_labels_received(self, wallet, labels):
+        if wallet == self.wallet:
+            self.initModel(True)  # TODO: be less dramatic
+
     def rowCount(self, index):
         return len(self.tx_history)
 
@@ -122,15 +127,14 @@ class QETransactionListModel(QAbstractListModel, QtEventListener):
         #self._logger.debug(str(tx_item))
         item = tx_item
 
-        item['key'] = item['txid'] if 'txid' in item else item['payment_hash']
+        item['key'] = item.get('txid') or item['payment_hash'] or item['group_id'] # fixme: this is fragile
 
         if 'lightning' not in item:
             item['lightning'] = False
 
         if item['lightning']:
             item['value'] = QEAmount(amount_sat=item['value'].value, amount_msat=item['amount_msat'])
-            if item['type'] == 'payment':
-                item['incoming'] = True if item['direction'] == 'received' else False
+            item['incoming'] = True if item['amount_msat'] > 0 else False
             item['confirmations'] = 0
         else:
             item['value'] = QEAmount(amount_sat=item['value'].value)
@@ -145,12 +149,13 @@ class QETransactionListModel(QAbstractListModel, QtEventListener):
         # newly arriving txs, or (partially/fully signed) local txs have no (block) timestamp
         # FIXME just use wallet.get_tx_status, and change that as needed
         if not item['timestamp']:  # onchain: local or mempool or unverified txs
-            txid = item['txid']
-            assert txid
-            tx_mined_info = self._tx_mined_info_from_tx_item(tx_item)
-            item['section'] = 'local' if tx_mined_info.is_local_like() else 'mempool'
-            status, status_str = self.wallet.get_tx_status(txid, tx_mined_info=tx_mined_info)
-            item['date'] = status_str
+            if not item['lightning']:
+                txid = item['txid']
+                assert txid
+                tx_mined_info = self._tx_mined_info_from_tx_item(tx_item)
+                item['section'] = 'local' if tx_mined_info.is_local_like() else 'mempool'
+                status, status_str = self.wallet.get_tx_status(txid, tx_mined_info=tx_mined_info)
+                item['date'] = status_str
         else:  # lightning or already mined (and SPV-ed) onchain txs
             item['section'] = self.get_section_by_timestamp(item['timestamp'])
             item['date'] = self.format_date_by_section(item['section'], datetime.fromtimestamp(item['timestamp']))
@@ -231,7 +236,7 @@ class QETransactionListModel(QAbstractListModel, QtEventListener):
                 tx['timestamp'] = info.timestamp
                 tx['section'] = self.get_section_by_timestamp(info.timestamp)
                 tx['date'] = self.format_date_by_section(tx['section'], datetime.fromtimestamp(info.timestamp))
-                index = self.index(i,0)
+                index = self.index(i, 0)
                 roles = [self._ROLE_RMAP[x] for x in ['section', 'height', 'confirmations', 'timestamp', 'date']]
                 self.dataChanged.emit(index, index, roles)
                 return
@@ -259,7 +264,7 @@ class QETransactionListModel(QAbstractListModel, QtEventListener):
         for i, tx in enumerate(self.tx_history):
             if tx['key'] == key:
                 tx['label'] = label
-                index = self.index(i,0)
+                index = self.index(i, 0)
                 self.dataChanged.emit(index, index, [self._ROLE_RMAP['label']])
                 return
 
@@ -270,7 +275,7 @@ class QETransactionListModel(QAbstractListModel, QtEventListener):
             if 'height' in tx_item:
                 if tx_item['height'] > 0:
                     tx_item['confirmations'] = height - tx_item['height'] + 1
-                    index = self.index(i,0)
+                    index = self.index(i, 0)
                     roles = [self._ROLE_RMAP['confirmations']]
                     self.dataChanged.emit(index, index, roles)
                 elif tx_item['height'] in (TX_HEIGHT_FUTURE, TX_HEIGHT_LOCAL):

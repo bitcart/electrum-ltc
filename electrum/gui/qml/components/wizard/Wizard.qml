@@ -84,6 +84,14 @@ ElDialog {
                 console.log('END')
             }
         })
+        page.finish.connect(function() {
+            // run wizard.submit() a final time, so that the navmap[view]['accept'] handler can run (if any)
+            var newview = wiz.submit(page.wizard_data)
+            _setWizardData(newview.wizard_data)
+            console.log('wizard finished')
+            // finish wizard
+            wizard.doAccept()
+        })
         page.prev.connect(function() {
             var wdata = wiz.prev()
         })
@@ -134,7 +142,7 @@ ElDialog {
             function finish() {
                 currentItem.accept()
                 _setWizardData(pages.contentChildren[currentIndex].wizard_data)
-                wizard.doAccept()
+                currentItem.finish()
             }
 
             property bool pagevalid: false
@@ -151,54 +159,40 @@ ElDialog {
             }
         }
 
-        ColumnLayout {
-            Layout.alignment: Qt.AlignHCenter | Qt.AlignBottom
+        ButtonContainer {
+            Layout.fillWidth: true
 
-            PageIndicator {
-                id: indicator
-
-                Layout.alignment: Qt.AlignHCenter
-
-                count: pages.count
-                currentIndex: pages.currentIndex
-            }
-
-            ButtonContainer {
+            FlatButton {
                 Layout.fillWidth: true
-
-                FlatButton {
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 1
-                    visible: pages.currentIndex == 0
-                    text: qsTr("Cancel")
-                    onClicked: wizard.doReject()
-                }
-                FlatButton {
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 1
-                    visible: pages.currentIndex > 0
-                    text: qsTr('Back')
-                    onClicked: pages.prev()
-                }
-                FlatButton {
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 1
-                    text: qsTr("Next")
-                    visible: !pages.lastpage
-                    enabled: pages.pagevalid
-                    onClicked: pages.next()
-                }
-                FlatButton {
-                    id: finishButton
-                    Layout.fillWidth: true
-                    Layout.preferredWidth: 1
-                    text: qsTr("Finish")
-                    visible: pages.lastpage
-                    enabled: pages.pagevalid
-                    onClicked: pages.finish()
-                }
+                Layout.preferredWidth: 1
+                visible: pages.currentIndex == 0
+                text: qsTr("Cancel")
+                onClicked: wizard.doReject()
             }
-
+            FlatButton {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 1
+                visible: pages.currentIndex > 0
+                text: qsTr('Back')
+                onClicked: pages.prev()
+            }
+            FlatButton {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 1
+                text: qsTr("Next")
+                visible: !pages.lastpage
+                enabled: pages.pagevalid
+                onClicked: pages.next()
+            }
+            FlatButton {
+                id: finishButton
+                Layout.fillWidth: true
+                Layout.preferredWidth: 1
+                text: qsTr("Finish")
+                visible: pages.lastpage
+                enabled: pages.pagevalid
+                onClicked: pages.finish()
+            }
         }
     }
 

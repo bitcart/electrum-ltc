@@ -2,9 +2,9 @@ import threading
 from functools import partial
 from typing import TYPE_CHECKING
 
-from PyQt5.QtCore import Qt, pyqtSignal, QRegExp
-from PyQt5.QtGui import QRegExpValidator
-from PyQt5.QtWidgets import (QVBoxLayout, QLabel, QGridLayout, QPushButton,
+from PyQt6.QtCore import Qt, pyqtSignal, QRegularExpression
+from PyQt6.QtGui import QRegularExpressionValidator
+from PyQt6.QtWidgets import (QVBoxLayout, QLabel, QGridLayout, QPushButton,
                              QHBoxLayout, QButtonGroup, QGroupBox,
                              QTextEdit, QLineEdit, QRadioButton, QCheckBox, QWidget,
                              QMessageBox, QFileDialog, QSlider, QTabWidget)
@@ -14,13 +14,15 @@ from electrum.gui.qt.util import (WindowModalDialog, WWLabel, Buttons, CancelBut
 from electrum.i18n import _
 from electrum.plugin import hook
 from electrum.logging import Logger
+from electrum.util import ChoiceItem
 
-from ..hw_wallet.qt import QtHandlerBase, QtPluginBase
-from ..hw_wallet.plugin import only_hook_if_libraries_available
+from electrum.hw_wallet.qt import QtHandlerBase, QtPluginBase
+from electrum.hw_wallet.trezor_qt_pinmatrix import PinMatrixWidget
+from electrum.hw_wallet.plugin import only_hook_if_libraries_available
+
 from .safe_t import SafeTPlugin, TIM_NEW, TIM_RECOVER, TIM_MNEMONIC, TIM_PRIVKEY
 
-from electrum.gui.qt.wizard.wallet import WCScriptAndDerivation, WCHWUnlock, WCHWXPub
-from electrum.gui.qt.wizard.wizard import WizardComponent
+from electrum.gui.qt.wizard.wallet import WCScriptAndDerivation, WCHWUnlock, WCHWXPub, WalletWizardComponent
 
 if TYPE_CHECKING:
     from electrum.gui.qt.wizard.wallet import QENewWalletWizard
@@ -67,7 +69,7 @@ class QtHandler(QtHandlerBase):
         vbox.addWidget(matrix)
         vbox.addLayout(Buttons(CancelButton(dialog), OkButton(dialog)))
         dialog.setLayout(vbox)
-        dialog.exec_()
+        dialog.exec()
         self.response = str(matrix.get_value())
         self.done.set()
 
@@ -82,12 +84,12 @@ class QtPlugin(QtPluginBase):
     def receive_menu(self, menu, addrs, wallet):
         if len(addrs) != 1:
             return
-        for keystore in wallet.get_keystores():
-            if type(keystore) == self.keystore_class:
-                def show_address(keystore=keystore):
-                    keystore.thread.add(partial(self.show_address, wallet, addrs[0], keystore))
-                device_name = "{} ({})".format(self.device, keystore.label)
-                menu.addAction(_("Show on {}").format(device_name), show_address)
+        self._add_menu_action(menu, addrs[0], wallet)
+
+    @only_hook_if_libraries_available
+    @hook
+    def transaction_dialog_address_menu(self, menu, addr, wallet):
+        self._add_menu_action(menu, addr, wallet)
 
     def show_settings_dialog(self, window, keystore):
         def connect():
@@ -95,7 +97,7 @@ class QtPlugin(QtPluginBase):
             return device_id
         def show_dialog(device_id):
             if device_id:
-                SettingsDialog(window, self, keystore, device_id).exec_()
+                SettingsDialog(window, self, keystore, device_id).exec()
         keystore.thread.add(connect, on_success=show_dialog)
 
 
@@ -153,7 +155,7 @@ class SafeTInitLayout(QVBoxLayout):
             self.addWidget(QLabel(msg))
             self.addWidget(self.text_e)
             self.pin = QLineEdit()
-            self.pin.setValidator(QRegExpValidator(QRegExp('[1-9]{0,9}')))
+            self.pin.setValidator(QRegularExpressionValidator(QRegularExpression('[1-9]{0,9}')))
             self.pin.setMaximumWidth(100)
             hbox_pin = QHBoxLayout()
             hbox_pin.addWidget(QLabel(_("Enter your PIN (digits 1-9):")))
@@ -195,7 +197,6 @@ class Plugin(SafeTPlugin, QtPlugin):
 
     @classmethod
     def pin_matrix_widget_class(self):
-        from safetlib.qt.pinmatrix import PinMatrixWidget
         return PinMatrixWidget
 
     @hook
@@ -352,7 +353,7 @@ class SettingsDialog(WindowModalDialog):
                 msg = _("Are you SURE you want to wipe the device?\n"
                         "Your wallet still has bitcoins in it!")
                 if not self.question(msg, title=title,
-                                     icon=QMessageBox.Critical):
+                                     icon=QMessageBox.Icon.Critical):
                     return
             invoke_client('wipe_device', unpair_after=True)
 
@@ -454,11 +455,11 @@ class SettingsDialog(WindowModalDialog):
         # Settings tab - Session Timeout
         timeout_label = QLabel(_("Session Timeout"))
         timeout_minutes = QLabel()
-        timeout_slider = QSlider(Qt.Horizontal)
+        timeout_slider = QSlider(Qt.Orientation.Horizontal)
         timeout_slider.setRange(1, 60)
         timeout_slider.setSingleStep(1)
         timeout_slider.setTickInterval(5)
-        timeout_slider.setTickPosition(QSlider.TicksBelow)
+        timeout_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         timeout_slider.setTracking(True)
         timeout_msg = QLabel(
             _("Clear the session after the specified period "
@@ -534,12 +535,13 @@ class SettingsDialog(WindowModalDialog):
         invoke_client(None)
 
 
-class WCSafeTInitMethod(WizardComponent):
+class WCSafeTInitMethod(WalletWizardComponent):
     def __init__(self, parent, wizard):
-        WizardComponent.__init__(self, parent, wizard, title=_('HW Setup'))
+        WalletWizardComponent.__init__(self, parent, wizard, title=_('Safe-T Setup'))
 
     def on_ready(self):
-        _name, _info = self.wizard_data['hardware_device']
+        current_cosigner = self.wizard.current_cosigner(self.wizard_data)
+        _name, _info = current_cosigner['hardware_device']
         msg = _("Choose how you want to initialize your {}.\n\n"
                 "The first two methods are secure as no secret information "
                 "is entered into your computer.\n\n"
@@ -550,10 +552,10 @@ class WCSafeTInitMethod(WizardComponent):
                 ).format(_info.model_name, _info.model_name)
         choices = [
             # Must be short as QT doesn't word-wrap radio button text
-            (TIM_NEW, _("Let the device generate a completely new seed randomly")),
-            (TIM_RECOVER, _("Recover from a seed you have previously written down")),
-            (TIM_MNEMONIC, _("Upload a BIP39 mnemonic to generate the seed")),
-            (TIM_PRIVKEY, _("Upload a master private key"))
+            ChoiceItem(key=TIM_NEW, label=_("Let the device generate a completely new seed randomly")),
+            ChoiceItem(key=TIM_RECOVER, label=_("Recover from a seed you have previously written down")),
+            ChoiceItem(key=TIM_MNEMONIC, label=_("Upload a BIP39 mnemonic to generate the seed")),
+            ChoiceItem(key=TIM_PRIVKEY, label=_("Upload a master private key"))
         ]
         self.choice_w = ChoiceWidget(message=msg, choices=choices)
         self.layout().addWidget(self.choice_w)
@@ -562,35 +564,38 @@ class WCSafeTInitMethod(WizardComponent):
         self._valid = True
 
     def apply(self):
-        self.wizard_data['safe_t_init'] = self.choice_w.selected_item[0]
+        current_cosigner = self.wizard.current_cosigner(self.wizard_data)
+        current_cosigner['safe_t_init'] = self.choice_w.selected_key
 
 
-class WCSafeTInitParams(WizardComponent):
+class WCSafeTInitParams(WalletWizardComponent):
     def __init__(self, parent, wizard):
-        WizardComponent.__init__(self, parent, wizard, title=_('Set-up safe-t'))
+        WalletWizardComponent.__init__(self, parent, wizard, title=_('Safe-T Setup'))
         self.plugins = wizard.plugins
         self._busy = True
 
     def on_ready(self):
-        _name, _info = self.wizard_data['hardware_device']
-        self.settings_layout = SafeTInitLayout(self.wizard_data['safe_t_init'], _info.device.id_)
+        current_cosigner = self.wizard.current_cosigner(self.wizard_data)
+        _name, _info = current_cosigner['hardware_device']
+        self.settings_layout = SafeTInitLayout(current_cosigner['safe_t_init'], _info.device.id_)
         self.settings_layout.validChanged.connect(self.on_settings_valid_changed)
         self.layout().addLayout(self.settings_layout)
         self.layout().addStretch(1)
 
-        self.valid = self.wizard_data['safe_t_init'] != TIM_PRIVKEY
+        self.valid = current_cosigner['safe_t_init'] != TIM_PRIVKEY
         self.busy = False
 
     def on_settings_valid_changed(self, is_valid: bool):
         self.valid = is_valid
 
     def apply(self):
-        self.wizard_data['safe_t_settings'] = self.settings_layout.get_settings()
+        current_cosigner = self.wizard.current_cosigner(self.wizard_data)
+        current_cosigner['safe_t_settings'] = self.settings_layout.get_settings()
 
 
-class WCSafeTInit(WizardComponent, Logger):
+class WCSafeTInit(WalletWizardComponent, Logger):
     def __init__(self, parent, wizard):
-        WizardComponent.__init__(self, parent, wizard, title=_('Set-up safe-t'))
+        WalletWizardComponent.__init__(self, parent, wizard, title=_('Safe-T Setup'))
         Logger.__init__(self)
         self.plugins = wizard.plugins
         self.plugin = self.plugins.get_plugin('safe_t')
@@ -600,9 +605,10 @@ class WCSafeTInit(WizardComponent, Logger):
         self._busy = True
 
     def on_ready(self):
-        settings = self.wizard_data['safe_t_settings']
-        method = self.wizard_data['safe_t_init']
-        _name, _info = self.wizard_data['hardware_device']
+        current_cosigner = self.wizard.current_cosigner(self.wizard_data)
+        settings = current_cosigner['safe_t_settings']
+        method = current_cosigner['safe_t_init']
+        _name, _info = current_cosigner['hardware_device']
         device_id = _info.device.id_
         client = self.plugins.device_manager.client_by_id(device_id, scan_now=False)
         client.handler = self.plugin.create_handler(self.wizard)
@@ -616,6 +622,7 @@ class WCSafeTInit(WizardComponent, Logger):
             except Exception as e:
                 self.valid = False
                 self.error = repr(e)
+                self.logger.exception(repr(e))
             finally:
                 self.busy = False
 

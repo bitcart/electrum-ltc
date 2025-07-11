@@ -1,3 +1,27 @@
+#!/usr/bin/env python
+#
+# Electrum - lightweight Bitcoin client
+# Copyright (C) 2025 The Electrum Developers
+#
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation files
+# (the "Software"), to deal in the Software without restriction,
+# including without limitation the rights to use, copy, modify, merge,
+# publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 import os
 import asyncio
 from collections import defaultdict
@@ -8,14 +32,13 @@ from aiohttp import web
 from electrum.util import log_exceptions, ignore_exceptions
 from electrum.logging import Logger
 from electrum.util import EventListener
-from electrum.lnaddr import lndecode
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
     from electrum.wallet import Abstract_Wallet
 
 
-class SwapServer(Logger, EventListener):
+class HttpSwapServer(Logger, EventListener):
     """
     public API:
     - getpairs
@@ -38,6 +61,11 @@ class SwapServer(Logger, EventListener):
     @ignore_exceptions
     @log_exceptions
     async def run(self):
+
+        while self.wallet.has_password() and self.wallet.get_unlocked_password() is None:
+            self.logger.info("This wallet is password-protected. Please unlock it to start the swapserver plugin")
+            await asyncio.sleep(10)
+
         app = web.Application()
         app.add_routes([web.get('/getpairs', self.get_pairs)])
         app.add_routes([web.post('/createswap', self.create_swap)])
@@ -52,7 +80,7 @@ class SwapServer(Logger, EventListener):
 
     async def get_pairs(self, r):
         sm = self.sm
-        sm.init_pairs()
+        sm.server_update_pairs()
         pairs = {
             "info": [],
             "warnings": [],
@@ -61,29 +89,29 @@ class SwapServer(Logger, EventListener):
                 "BTC/BTC": {
                     "rate": 1,
                     "limits": {
-                        "maximal": sm._max_amount,
+                        "maximal": min(sm._max_forward, sm._max_reverse),  # legacy
+                        "max_forward_amount": sm._max_forward,  # new version, uses 2 separate limits
+                        "max_reverse_amount": sm._max_reverse,
                         "minimal": sm._min_amount,
-                        "maximalZeroConf": {
-                            "baseAsset": 0,
-                            "quoteAsset": 0
-                        }
                     },
                     "fees": {
-                        "percentage": 0.5,
+                        "percentage": sm.percentage,
                         "minerFees": {
                             "baseAsset": {
-                                "normal": sm.normal_fee,
+                                "normal": sm.mining_fee,
                                 "reverse": {
-                                    "claim": sm.claim_fee,
-                                    "lockup": sm.lockup_fee
-                                }
+                                    "claim": sm.mining_fee,
+                                    "lockup": sm.mining_fee
+                                },
+                                "mining_fee": sm.mining_fee
                             },
                             "quoteAsset": {
-                                "normal": sm.normal_fee,
+                                "normal": sm.mining_fee,
                                 "reverse": {
-                                    "claim": sm.claim_fee,
-                                    "lockup": sm.lockup_fee
-                                }
+                                    "claim": sm.mining_fee,
+                                    "lockup": sm.mining_fee
+                                },
+                                "mining_fee": sm.mining_fee
                             }
                         }
                     }
@@ -94,58 +122,15 @@ class SwapServer(Logger, EventListener):
 
     async def add_swap_invoice(self, r):
         request = await r.json()
-        invoice = request['invoice']
-        self.sm.add_invoice(invoice, pay_now=True)
+        self.sm.server_add_swap_invoice(request)
         return web.json_response({})
 
     async def create_normal_swap(self, r):
-        # normal for client, reverse for server
         request = await r.json()
-        lightning_amount_sat = request['invoiceAmount']
-        their_pubkey = bytes.fromhex(request['refundPublicKey'])
-        assert len(their_pubkey) == 33
-        swap = self.sm.create_reverse_swap(
-            lightning_amount_sat=lightning_amount_sat,
-            their_pubkey=their_pubkey,
-        )
-        response = {
-            "id": swap.payment_hash.hex(),
-            'preimageHash': swap.payment_hash.hex(),
-            "acceptZeroConf": False,
-            "expectedAmount": swap.onchain_amount,
-            "timeoutBlockHeight": swap.locktime,
-            "address": swap.lockup_address,
-            "redeemScript": swap.redeem_script.hex(),
-        }
+        response = self.sm.server_create_normal_swap(request)
         return web.json_response(response)
 
     async def create_swap(self, r):
-        # reverse for client, forward for server
-        # requesting a normal swap (old protocol) will raise an exception
-        self.sm.init_pairs()
         request = await r.json()
-        req_type = request['type']
-        assert request['pairId'] == 'BTC/BTC'
-        if req_type == 'reversesubmarine':
-            lightning_amount_sat=request['invoiceAmount']
-            payment_hash=bytes.fromhex(request['preimageHash'])
-            their_pubkey=bytes.fromhex(request['claimPublicKey'])
-            assert len(payment_hash) == 32
-            assert len(their_pubkey) == 33
-            swap, invoice, prepay_invoice = self.sm.create_normal_swap(
-                lightning_amount_sat=lightning_amount_sat,
-                payment_hash=payment_hash,
-                their_pubkey=their_pubkey
-            )
-            response = {
-                'id': payment_hash.hex(),
-                'invoice': invoice,
-                'minerFeeInvoice': prepay_invoice,
-                'lockupAddress': swap.lockup_address,
-                'redeemScript': swap.redeem_script.hex(),
-                'timeoutBlockHeight': swap.locktime,
-                "onchainAmount": swap.onchain_amount,
-            }
-        else:
-            raise Exception('unsupported request type:' + req_type)
+        response = self.sm.server_create_swap(request)
         return web.json_response(response)

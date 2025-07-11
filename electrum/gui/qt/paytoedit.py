@@ -24,18 +24,19 @@
 # SOFTWARE.
 
 from functools import partial
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Union
 
-from PyQt5.QtCore import Qt, QTimer, QSize
-from PyQt5.QtCore import QObject, pyqtSignal
-from PyQt5.QtGui import QFontMetrics, QFont
-from PyQt5.QtWidgets import QApplication, QTextEdit, QWidget, QLineEdit, QStackedLayout, QSizePolicy
+from PyQt6.QtCore import Qt, QTimer, QSize, QStringListModel
+from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtGui import QFontMetrics, QFont, QContextMenuEvent
+from PyQt6.QtWidgets import QTextEdit, QWidget, QLineEdit, QStackedLayout, QCompleter
 
 from electrum.payment_identifier import PaymentIdentifier
 from electrum.logging import Logger
+from electrum.util import EventListener, event_listener
 
 from . import util
-from .util import MONOSPACE_FONT, GenericInputHandler, editor_contextMenuEvent, ColorScheme
+from .util import MONOSPACE_FONT, GenericInputHandler, ColorScheme, add_input_actions_to_context_menu
 
 if TYPE_CHECKING:
     from .send_tab import SendTab
@@ -85,7 +86,7 @@ class ResizingTextEdit(QTextEdit):
         h = min(max(h, self.heightMin), self.heightMax)
         self.setMinimumHeight(int(h))
         self.setMaximumHeight(int(h))
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.verticalScrollBar().setHidden(docHeight + self.verticalMargins < self.heightMax)
         self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.resized.emit()
@@ -94,7 +95,7 @@ class ResizingTextEdit(QTextEdit):
         return QSize(0, self.minimumHeight())
 
 
-class PayToEdit(QWidget, Logger, GenericInputHandler):
+class PayToEdit(QWidget, Logger, GenericInputHandler, EventListener):
     paymentIdentifierChanged = pyqtSignal()
     textChanged = pyqtSignal()
 
@@ -106,6 +107,8 @@ class PayToEdit(QWidget, Logger, GenericInputHandler):
         self._text = ''
         self._layout = QStackedLayout()
         self.setLayout(self._layout)
+
+        self.send_tab = send_tab
 
         def text_edit_changed():
             text = self.text_edit.toPlainText()
@@ -129,8 +132,24 @@ class PayToEdit(QWidget, Logger, GenericInputHandler):
         self.line_edit = QLineEdit()
         self.line_edit.textChanged.connect(line_edit_changed)
         self.text_edit = ResizingTextEdit()
+        self.text_edit.setTabChangesFocus(True)
         self.text_edit.textReallyChanged.connect(text_edit_changed)
         self.text_edit.resized.connect(text_edit_resized)
+
+        def on_completed(item: str):
+            text = self._completer_contacts[1][self._completer_contacts[0].index(item)]
+            self.try_payment_identifier(text)
+            self.completer.popup().hide()
+
+        self.completer = QCompleter()
+        self.completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.completer.activated.connect(on_completed)
+
+        self.update_completer()
+
+        self.line_edit.setCompleter(self.completer)
 
         self.textChanged.connect(self._handle_text_change)
 
@@ -140,6 +159,7 @@ class PayToEdit(QWidget, Logger, GenericInputHandler):
         self.multiline = False
 
         self._is_paytomany = False
+        self.line_edit.setFont(QFont(MONOSPACE_FONT))
         self.text_edit.setFont(QFont(MONOSPACE_FONT))
         self.send_tab = send_tab
         self.config = send_tab.config
@@ -159,6 +179,13 @@ class PayToEdit(QWidget, Logger, GenericInputHandler):
             show_error=self.send_tab.show_error,
             setText=self.try_payment_identifier,
         )
+        self.on_qr_from_file_input_btn = partial(
+            self.input_qr_from_file,
+            allow_multi=False,
+            config=self.config,
+            show_error=self.send_tab.show_error,
+            setText=self.try_payment_identifier,
+        )
         self.on_input_file = partial(
             self.input_file,
             config=self.config,
@@ -166,8 +193,8 @@ class PayToEdit(QWidget, Logger, GenericInputHandler):
             setText=self.try_payment_identifier,
         )
 
-        self.text_edit.contextMenuEvent = partial(editor_contextMenuEvent, self.text_edit, self)
-        self.line_edit.contextMenuEvent = partial(editor_contextMenuEvent, self.line_edit, self)
+        self.text_edit.contextMenuEvent = partial(self.custom_context_menu_event, tl_edit=self.text_edit)
+        self.line_edit.contextMenuEvent = partial(self.custom_context_menu_event, tl_edit=self.line_edit)
 
         self.edit_timer = QTimer(self)
         self.edit_timer.setSingleShot(True)
@@ -175,6 +202,27 @@ class PayToEdit(QWidget, Logger, GenericInputHandler):
         self.edit_timer.timeout.connect(self._on_edit_timer)
 
         self.payment_identifier = None  # type: Optional[PaymentIdentifier]
+
+        self.register_callbacks()
+        self.destroyed.connect(lambda: self.unregister_callbacks())
+
+    def custom_context_menu_event(self, e: 'QContextMenuEvent', *, tl_edit: Union[QTextEdit, QLineEdit]) -> None:
+        m = tl_edit.createStandardContextMenu()
+        m.addSeparator()
+        add_input_actions_to_context_menu(self, m)
+        m.exec(e.globalPos())
+
+    @event_listener
+    def on_event_contacts_updated(self):
+        self.update_completer()
+
+    def update_completer(self):
+        self._completer_contacts = [], []
+        for k, v in self.send_tab.wallet.contacts.items():
+            self._completer_contacts[0].append(f'{v[1]} <{k}>')
+            self._completer_contacts[1].append(k)
+
+        self.completer.setModel(QStringListModel(self._completer_contacts[0]))
 
     @property
     def multiline(self):
@@ -197,7 +245,7 @@ class PayToEdit(QWidget, Logger, GenericInputHandler):
             self.line_edit.setText(text)
             self.text_edit.setText(text)
 
-    def setFocus(self, reason=None) -> None:
+    def setFocus(self, reason=Qt.FocusReason.OtherFocusReason) -> None:
         if self.multiline:
             self.text_edit.setFocus(reason)
         else:
@@ -209,15 +257,13 @@ class PayToEdit(QWidget, Logger, GenericInputHandler):
 
     def try_payment_identifier(self, text) -> None:
         '''set payment identifier only if valid, else exception'''
-        text = text.strip()
         pi = PaymentIdentifier(self.send_tab.wallet, text)
         if not pi.is_valid():
             raise InvalidPaymentIdentifier('Invalid payment identifier')
         self.set_payment_identifier(text)
 
     def set_payment_identifier(self, text) -> None:
-        text = text.strip()
-        if self.payment_identifier and self.payment_identifier.text == text:
+        if self.payment_identifier and self.payment_identifier.text == text.strip():
             # no change.
             return
 

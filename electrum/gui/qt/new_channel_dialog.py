@@ -1,25 +1,21 @@
 from typing import TYPE_CHECKING, Optional
+from PyQt6.QtWidgets import QLabel, QVBoxLayout, QGridLayout, QPushButton, QComboBox, QLineEdit, QHBoxLayout
 
-from PyQt5.QtWidgets import QLabel, QVBoxLayout, QGridLayout, QPushButton, QComboBox, QLineEdit, QSpacerItem, QWidget, QHBoxLayout
+import electrum_ecc as ecc
 
 from electrum.i18n import _
-from electrum.transaction import PartialTxOutput, PartialTransaction
 from electrum.lnutil import MIN_FUNDING_SAT
 from electrum.lnworker import hardcoded_trampoline_nodes
-from electrum import ecc
 from electrum.util import NotEnoughFunds, NoDynamicFeeEstimates
+from electrum.fee_policy import FeePolicy
 
-from electrum.gui import messages
-from . import util
 from .util import (WindowModalDialog, Buttons, OkButton, CancelButton,
-                   EnterButton, ColorScheme, WWLabel, read_QIcon, IconLabel,
-                   char_width_in_lineedit)
+                   EnterButton, WWLabel, char_width_in_lineedit)
 from .amountedit import BTCAmountEdit
 from .my_treeview import create_toolbar_with_menu
 
 if TYPE_CHECKING:
     from .main_window import ElectrumWindow
-
 
 
 class NewChannelDialog(WindowModalDialog):
@@ -37,6 +33,7 @@ class NewChannelDialog(WindowModalDialog):
         toolbar, menu = create_toolbar_with_menu(self.config, '')
         menu.addConfig(
             self.config.cv.LIGHTNING_USE_RECOVERABLE_CHANNELS,
+            checked=self.lnworker.has_recoverable_channels(),
         ).setEnabled(self.lnworker.can_have_recoverable_channels())
         vbox.addLayout(toolbar)
         msg = _('Choose a remote node and an amount to fund the channel.')
@@ -96,7 +93,8 @@ class NewChannelDialog(WindowModalDialog):
         if not nodeid:
             self.remote_nodeid.setText("")
             self.remote_nodeid.setPlaceholderText(
-                "Please wait until the graph is synchronized to 30%, and then try again.")
+                _("Couldn't find suitable peer yet, try again later.")
+            )
         else:
             self.remote_nodeid.setText(nodeid)
         self.remote_nodeid.repaint()  # macOS hack for #6269
@@ -113,6 +111,7 @@ class NewChannelDialog(WindowModalDialog):
 
     def spend_min(self):
         self.max_button.setChecked(False)
+        self.amount_e.setFrozen(False)
         self.amount_e.setAmount(self.min_amount_sat)
 
     def spend_max(self):
@@ -122,7 +121,7 @@ class NewChannelDialog(WindowModalDialog):
         dummy_nodeid = ecc.GENERATOR.get_public_key_bytes(compressed=True)
         make_tx = self.window.mktx_for_open_channel(funding_sat='!', node_id=dummy_nodeid)
         try:
-            tx = make_tx(None)
+            tx = make_tx(FeePolicy(self.config.FEE_POLICY))
         except (NotEnoughFunds, NoDynamicFeeEstimates) as e:
             self.max_button.setChecked(False)
             self.amount_e.setFrozen(False)
@@ -133,7 +132,7 @@ class NewChannelDialog(WindowModalDialog):
         self.amount_e.setAmount(amount)
 
     def run(self):
-        if not self.exec_():
+        if not self.exec():
             return
         if self.max_button.isChecked() and self.amount_e.get_amount() < self.config.LIGHTNING_MAX_FUNDING_SAT:
             # if 'max' enabled and amount is strictly less than max allowed,

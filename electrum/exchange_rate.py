@@ -8,17 +8,18 @@ import time
 import csv
 import decimal
 from decimal import Decimal
-from typing import Sequence, Optional, Mapping, Dict, Union, Any
+from typing import Sequence, Optional, Mapping, Dict, Union, Tuple
 
-from aiorpcx.curio import timeout_after, TaskTimeout, ignore_after
+from aiorpcx.curio import timeout_after, ignore_after
 import aiohttp
 
 from . import util
 from .bitcoin import COIN
 from .i18n import _
-from .util import (ThreadJob, make_dir, log_exceptions, OldTaskGroup,
-                   make_aiohttp_session, resource_path, EventListener, event_listener, to_decimal,
-                   timestamp_to_datetime)
+from .util import (
+    ThreadJob, make_dir, log_exceptions, OldTaskGroup, make_aiohttp_session, resource_path, EventListener,
+    event_listener, to_decimal, timestamp_to_datetime
+)
 from .util import NetworkRetryManager
 from .network import Network
 from .simple_config import SimpleConfig
@@ -33,7 +34,7 @@ CCY_PRECISIONS = {'BHD': 3, 'BIF': 0, 'BYR': 0, 'CLF': 4, 'CLP': 0,
                   'RWF': 0, 'TND': 3, 'UGX': 0, 'UYI': 0, 'VND': 0,
                   'VUV': 0, 'XAF': 0, 'XAU': 4, 'XOF': 0, 'XPF': 0,
                   # Cryptocurrencies
-                  'BTC': 8, 'LTC': 8, 'XRP': 6, 'ETH': 18,
+                  'BTC': 8, 'LTC': 6, 'XRP': 4, 'ETH': 8,
                   }
 
 SPOT_RATE_REFRESH_TARGET = 150      # approx. every 2.5 minutes, try to refresh spot price
@@ -45,7 +46,7 @@ class ExchangeBase(Logger):
 
     def __init__(self, on_quotes, on_history):
         Logger.__init__(self)
-        self._history = {}  # type: Dict[str, Dict[str, str]]
+        self._history = {}  # type: Dict[str, Dict[str, str | float]]
         self._quotes = {}  # type: Dict[str, Optional[Decimal]]
         self._quotes_timestamp = 0  # type: Union[int, float]
         self.on_quotes = on_quotes
@@ -93,35 +94,63 @@ class ExchangeBase(Logger):
             self.logger.exception(f"failed fx quotes: {repr(e)}")
             self.on_quotes()
         else:
-            self.logger.info("received fx quotes")
+            self.logger.debug("received fx quotes")
             self._quotes_timestamp = time.time()
             self.on_quotes(received_new_data=True)
 
-    def read_historical_rates(self, ccy: str, cache_dir: str) -> Optional[dict]:
-        filename = os.path.join(cache_dir, self.name() + '_'+ ccy)
+    @staticmethod
+    def _read_historical_rates_from_file(
+        *, exchange_name: str, ccy: str, cache_dir: str,
+    ) -> Tuple[Optional[Dict[str, str]], Optional[float]]:
+        filename = os.path.join(cache_dir, f"{exchange_name}_{ccy}")
         if not os.path.exists(filename):
-            return None
+            return None, None
         timestamp = os.stat(filename).st_mtime
         try:
             with open(filename, 'r', encoding='utf-8') as f:
                 h = json.loads(f.read())
         except Exception:
-            return None
+            return None, None
         if not h:  # e.g. empty dict
-            return None
+            return None, None
         # cast rates to str
         h = {date_str: str(rate) for (date_str, rate) in h.items()}
+        return h, timestamp
+
+    def read_historical_rates(self, ccy: str, cache_dir: str) -> Optional[dict]:
+        h, timestamp = self._read_historical_rates_from_file(
+            exchange_name=self.name(),
+            ccy=ccy,
+            cache_dir=cache_dir,
+        )
+        if not h:
+            return None
+        assert timestamp is not None
         h['timestamp'] = timestamp
         self._history[ccy] = h
         self.on_history()
         return h
 
+    @staticmethod
+    def _write_historical_rates_to_file(
+        *, exchange_name: str, ccy: str, cache_dir: str, history: Dict[str, str],
+    ) -> None:
+        # sanity check types of history dict
+        assert 'timestamp' not in history
+        for key, rate in history.items():
+            assert isinstance(key, str), f"{exchange_name=}. {ccy=}. {key=!r}. {rate=!r}"
+            assert isinstance(rate, str), f"{exchange_name=}. {ccy=}. {key=!r}. {rate=!r}"
+        # write to file
+        filename = os.path.join(cache_dir, f"{exchange_name}_{ccy}")
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(history, sort_keys=True))
+
     @log_exceptions
     async def get_historical_rates_safe(self, ccy: str, cache_dir: str) -> None:
         try:
             self.logger.info(f"requesting fx history for {ccy}")
-            h = await self.request_history(ccy)
-            self.logger.info(f"received fx history for {ccy}")
+            h_new = await self.request_history(ccy)
+            self.logger.debug(f"received fx history for {ccy}")
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             self.logger.info(f"failed fx history: {repr(e)}")
             return
@@ -129,11 +158,18 @@ class ExchangeBase(Logger):
             self.logger.exception(f"failed fx history: {repr(e)}")
             return
         # cast rates to str
-        h = {date_str: str(rate) for (date_str, rate) in h.items()}
-        filename = os.path.join(cache_dir, self.name() + '_' + ccy)
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(json.dumps(h))
-        h['timestamp'] = time.time()
+        h_new = {date_str: str(rate) for (date_str, rate) in h_new.items()}  # type: Dict[str, str]
+        # merge old history and new history. resolve duplicate dates using new data.
+        h_old, _timestamp = self._read_historical_rates_from_file(
+            exchange_name=self.name(), ccy=ccy, cache_dir=cache_dir,
+        )
+        h_old = h_old or {}
+        h = {**h_old, **h_new}
+        # write merged data to disk cache
+        self._write_historical_rates_to_file(
+            exchange_name=self.name(), ccy=ccy, cache_dir=cache_dir, history=h,
+        )
+        h['timestamp'] = time.time()  # note: this is the only item in h that has a float value
         self._history[ccy] = h
         self.on_history()
 
@@ -188,6 +224,7 @@ class Bit2C(ExchangeBase):
         return {'NIS': to_decimal(json['ll'])}
 
 
+
 class BitcoinAverage(ExchangeBase):
     # note: historical rates used to be freely available
     # but this is no longer the case. see #5188
@@ -232,13 +269,49 @@ class Bitso(ExchangeBase):
 class BitStamp(ExchangeBase):
 
     async def get_currencies(self):
-        return ['USD', 'EUR']
+        # ref https://www.bitstamp.net/api/#tag/Tickers/operation/GetCurrencyPairTickers
+        json = await self.get_json(
+            'www.bitstamp.net',
+            f"/api/v2/ticker/")
+        pairs = [ticker["pair"] for ticker in json]
+        pairs = [pair for pair in pairs
+                 if len(pair) == 7 and pair[:4] == "BTC/"]
+        return [pair[4:] for pair in pairs]
 
     async def get_rates(self, ccy):
+        # ref https://www.bitstamp.net/api/#tag/Tickers/operation/GetMarketTicker
         if ccy in CURRENCIES[self.name()]:
             json = await self.get_json('www.bitstamp.net', f'/api/v2/ticker/ltc{ccy.lower()}/')
             return {ccy: to_decimal(json['last'])}
         return {}
+
+    def history_ccys(self):
+        return CURRENCIES[self.name()]
+
+    async def request_history(self, ccy):
+        # ref https://www.bitstamp.net/api/#tag/Market-info/operation/GetOHLCData
+        merged_history = {}
+        history_starts = 1313625600  # for BTCUSD pair (probably earliest)
+        items_per_request = 1000
+        step = 86400
+
+        async def populate_history(endtime: int):
+            history = await self.get_json(
+                'www.bitstamp.net',
+                f"/api/v2/ohlc/btc{ccy.lower()}/?step={step}&limit={items_per_request}&end={endtime}")
+            history = dict([
+                (timestamp_to_datetime(int(h["timestamp"]), utc=True).strftime('%Y-%m-%d'), str(h["close"]))
+                for h in history["data"]["ohlc"]])
+            merged_history.update(history)
+
+        async with OldTaskGroup() as group:
+            endtime = int(time.time())
+            while True:
+                if endtime < history_starts:
+                    break
+                await group.spawn(populate_history(endtime=endtime))
+                endtime = endtime - items_per_request * step
+        return merged_history
 
 
 class Coinbase(ExchangeBase):
@@ -279,6 +352,11 @@ class CoinGecko(ExchangeBase):
         return CURRENCIES[self.name()]
 
     async def request_history(self, ccy):
+        # ref https://docs.coingecko.com/v3.0.1/reference/coins-id-market-chart
+        num_days = 365
+        # Setting `num_days = "max"` started erroring (around 2024-04) with:
+        # > Your request exceeds the allowed time range. Public API users are limited to querying
+        # > historical data within the past 365 days. Upgrade to a paid plan to enjoy full historical data access
         history = await self.get_json('api.coingecko.com',
                                       '/api/v3/coins/litecoin/market_chart?vs_currency=%s&days=max' % ccy)
 
@@ -333,6 +411,10 @@ class OKCoin(ExchangeBase):
         json = await self.get_json('www.okcoin.com', '/api/spot/v3/instruments/LTC-USD/ticker')
         return {'USD': to_decimal(json['last'])}
 
+    # async def request_history(self, ccy):
+    #     # ref https://docs.kraken.com/api/docs/rest-api/get-ohlc-data
+    #     pass  # limited to last 720 steps (step can by 1 day / 7 days / 15 days)
+
 
 class MercadoBitcoin(ExchangeBase):
 
@@ -386,11 +468,14 @@ def get_exchanges_and_currencies():
                 for name, klass in exchanges.items():
                     exchange = klass(None, None)
                     await group.spawn(get_currencies_safe(name, exchange))
-    loop = util.get_asyncio_loop()
+
+    loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(query_all_exchanges_for_their_ccys_over_network())
     except Exception as e:
         pass
+    finally:
+        loop.close()
     with open(path, 'w', encoding='utf-8') as f:
         f.write(json.dumps(d, indent=4, sort_keys=True))
     return d

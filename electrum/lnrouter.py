@@ -25,12 +25,13 @@
 
 import queue
 from collections import defaultdict
-from typing import Sequence, Tuple, Optional, Dict, TYPE_CHECKING, Set
+from typing import Sequence, Tuple, Optional, Dict, TYPE_CHECKING, Set, Callable
 import time
 import threading
 from threading import RLock
-import attr
 from math import inf
+
+import attr
 
 from .util import profiler, with_lock
 from .logging import Logger
@@ -105,16 +106,6 @@ class RouteEdge(PathEdge):
             cltv_delta=channel_policy.cltv_delta,
             node_features=node_info.features if node_info else 0)
 
-    def is_sane_to_use(self, amount_msat: int) -> bool:
-        # TODO revise ad-hoc heuristics
-        # cltv cannot be more than 2 weeks
-        if self.cltv_delta > 14 * 144:
-            return False
-        total_fee = self.fee_for_edge(amount_msat)
-        if total_fee > get_default_fee_budget_msat(invoice_amount_msat=amount_msat):
-            return False
-        return True
-
     def has_feature_varonion(self) -> bool:
         features = LnFeatures(self.node_features)
         return features.supports(LnFeatures.VAR_ONION_OPT)
@@ -124,7 +115,7 @@ class RouteEdge(PathEdge):
 
 @attr.s
 class TrampolineEdge(RouteEdge):
-    invoice_routing_info = attr.ib(type=bytes, default=None)
+    invoice_routing_info = attr.ib(type=Sequence[bytes], default=None)
     invoice_features = attr.ib(type=int, default=None)
     # this is re-defined from parent just to specify a default value:
     short_channel_id = attr.ib(default=ShortChannelID(8), repr=lambda val: str(val))
@@ -153,7 +144,6 @@ def is_route_within_budget(
     amt = amount_msat_for_dest
     cltv_cost_of_route = 0  # excluding cltv_delta_for_dest
     for route_edge in reversed(route[1:]):
-        if not route_edge.is_sane_to_use(amt): return False
         amt += route_edge.fee_for_edge(amt)
         cltv_cost_of_route += route_edge.cltv_delta
     fee_cost = amt - amount_msat_for_dest
@@ -167,12 +157,6 @@ def is_route_within_budget(
     if total_cltv_delta > NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE:
         return False
     return True
-
-
-def get_default_fee_budget_msat(*, invoice_amount_msat: int) -> int:
-    # fees <= 1 % of payment are fine
-    # fees <= 5 sat are fine
-    return max(5_000, invoice_amount_msat // 100)
 
 
 class LiquidityHint:
@@ -520,8 +504,9 @@ class LNPathFinder(Logger):
                 start_node=start_node,
                 end_node=end_node,
                 node_info=node_info)
-        if not route_edge.is_sane_to_use(payment_amt_msat):
-            return float('inf'), 0  # thanks but no thanks
+        # Cap cltv of any given edge at 2 weeks (the cost function would not work well for extreme cases)
+        if route_edge.cltv_delta > 14 * 144:
+            return float('inf'), 0
         # Distance metric notes:  # TODO constants are ad-hoc
         # ( somewhat based on https://github.com/lightningnetwork/lnd/pull/1358 )
         # - Edges have a base cost. (more edges -> less likely none will fail)
@@ -541,14 +526,21 @@ class LNPathFinder(Logger):
     def get_shortest_path_hops(
             self,
             *,
-            nodeA: bytes,
+            nodeA: bytes, # nodeA is expected to be our node id if channels are passed in my_sending_channels
             nodeB: bytes,
             invoice_amount_msat: int,
             my_sending_channels: Dict[ShortChannelID, 'Channel'] = None,
             private_route_edges: Dict[ShortChannelID, RouteEdge] = None,
+            node_filter: Optional[Callable[[bytes, NodeInfo], bool]] = None
     ) -> Dict[bytes, PathEdge]:
         # note: we don't lock self.channel_db, so while the path finding runs,
         #       the underlying graph could potentially change... (not good but maybe ~OK?)
+
+        # if destination is filtered, there is no route
+        if node_filter:
+            node_info = self.channel_db.get_node_info_for_node_id(nodeB)
+            if not node_filter(nodeB, node_info):
+                return {}
 
         # run Dijkstra
         # The search is run in the REVERSE direction, from nodeB to nodeA,
@@ -592,11 +584,16 @@ class LNPathFinder(Logger):
                 if channel_info is None:
                     continue
                 edge_startnode = channel_info.node2_id if channel_info.node1_id == edge_endnode else channel_info.node1_id
+                if node_filter:
+                    node_info = self.channel_db.get_node_info_for_node_id(edge_startnode)
+                    if not node_filter(edge_startnode, node_info):
+                        continue
                 is_mine = edge_channel_id in my_sending_channels
-                if is_mine:
-                    if edge_startnode == nodeA:  # payment outgoing, on our channel
-                        if not my_sending_channels[edge_channel_id].can_pay(amount_msat, check_frozen=True):
-                            continue
+                if edge_startnode == nodeA and my_sending_channels:  # payment outgoing, on our channel
+                    if edge_channel_id not in my_sending_channels:
+                        continue
+                    if not my_sending_channels[edge_channel_id].can_pay(amount_msat, check_frozen=True):
+                        continue
                 edge_cost, fee_for_edge_msat = self._edge_cost(
                     short_channel_id=edge_channel_id,
                     start_node=edge_startnode,
@@ -632,6 +629,7 @@ class LNPathFinder(Logger):
             invoice_amount_msat: int,
             my_sending_channels: Dict[ShortChannelID, 'Channel'] = None,
             private_route_edges: Dict[ShortChannelID, RouteEdge] = None,
+            node_filter: Optional[Callable[[bytes, NodeInfo], bool]] = None
     ) -> Optional[LNPaymentPath]:
         """Return a path from nodeA to nodeB."""
         assert type(nodeA) is bytes
@@ -645,7 +643,8 @@ class LNPathFinder(Logger):
             nodeB=nodeB,
             invoice_amount_msat=invoice_amount_msat,
             my_sending_channels=my_sending_channels,
-            private_route_edges=private_route_edges)
+            private_route_edges=private_route_edges,
+            node_filter=node_filter)
 
         if nodeA not in previous_hops:
             return None  # no path found
@@ -705,7 +704,7 @@ class LNPathFinder(Logger):
             nodeA: bytes,
             nodeB: bytes,
             invoice_amount_msat: int,
-            path = None,
+            path: Optional[Sequence[PathEdge]] = None,
             my_sending_channels: Dict[ShortChannelID, 'Channel'] = None,
             private_route_edges: Dict[ShortChannelID, RouteEdge] = None,
     ) -> Optional[LNPaymentRoute]:

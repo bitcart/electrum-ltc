@@ -18,13 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 import enum
-import os
-from collections import namedtuple, defaultdict
-import binascii
-import json
+from collections import defaultdict
 from enum import IntEnum, Enum
-from typing import (Optional, Dict, List, Tuple, NamedTuple, Set, Callable,
-                    Iterable, Sequence, TYPE_CHECKING, Iterator, Union, Mapping)
+from typing import (
+    Optional, Dict, List, Tuple, NamedTuple,
+    Iterable, Sequence, TYPE_CHECKING, Iterator, Union, Mapping)
 import time
 import threading
 from abc import ABC, abstractmethod
@@ -33,41 +31,43 @@ import itertools
 from aiorpcx import NetAddress
 import attr
 
-from . import ecc
+import electrum_ecc as ecc
+from electrum_ecc import ECPubkey
+
 from . import constants, util
-from .util import bfh, chunks, TxMinedInfo
-from .invoices import PR_PAID
+from .util import bfh, chunks, TxMinedInfo, error_text_bytes_to_safe_str
 from .bitcoin import redeem_script_to_address
 from .crypto import sha256, sha256d
 from .transaction import Transaction, PartialTransaction, TxInput, Sighash
 from .logging import Logger
-from .lnonion import OnionFailureCode, OnionRoutingFailure
+from .lntransport import LNPeerAddr
+from .lnonion import OnionRoutingFailure
 from . import lnutil
 from .lnutil import (Outpoint, LocalConfig, RemoteConfig, Keypair, OnlyPubkeyKeypair, ChannelConstraints,
                      get_per_commitment_secret_from_seed, secret_to_pubkey, derive_privkey, make_closing_tx,
                      sign_and_get_sig_string, RevocationStore, derive_blinded_pubkey, Direction, derive_pubkey,
-                     make_htlc_tx_with_open_channel, make_commitment, make_received_htlc, make_offered_htlc,
-                     HTLC_TIMEOUT_WEIGHT, HTLC_SUCCESS_WEIGHT, extract_ctn_from_tx_and_chan, UpdateAddHtlc,
+                     make_htlc_tx_with_open_channel, make_commitment, UpdateAddHtlc,
                      funding_output_script, SENT, RECEIVED, LOCAL, REMOTE, HTLCOwner, make_commitment_outputs,
                      ScriptHtlc, PaymentFailure, calc_fees_for_commitment_tx, RemoteMisbehaving, make_htlc_output_witness_script,
-                     ShortChannelID, map_htlcs_to_ctx_output_idxs, LNPeerAddr,
+                     ShortChannelID, map_htlcs_to_ctx_output_idxs,
                      fee_for_htlc_output, offered_htlc_trim_threshold_sat,
-                     received_htlc_trim_threshold_sat, make_commitment_output_to_remote_address,
-                     ChannelType, LNProtocolWarning)
-from .lnsweep import create_sweeptxs_for_our_ctx, create_sweeptxs_for_their_ctx
-from .lnsweep import create_sweeptx_for_their_revoked_htlc, SweepInfo
+                     received_htlc_trim_threshold_sat, make_commitment_output_to_remote_address, FIXED_ANCHOR_SAT,
+                     ChannelType, LNProtocolWarning, ZEROCONF_TIMEOUT)
+from .lnsweep import sweep_our_ctx, sweep_their_ctx
+from .lnsweep import sweep_their_htlctx_justice, sweep_our_htlctx, SweepInfo
+from .lnsweep import sweep_their_ctx_to_remote_backup
 from .lnhtlc import HTLCManager
 from .lnmsg import encode_msg, decode_msg
 from .address_synchronizer import TX_HEIGHT_LOCAL
 from .lnutil import CHANNEL_OPENING_TIMEOUT
 from .lnutil import ChannelBackupStorage, ImportedChannelBackupStorage, OnchainChannelBackupStorage
 from .lnutil import format_short_channel_id
-from .simple_config import FEERATE_PER_KW_MIN_RELAY_LIGHTNING
+from .fee_policy import FEERATE_PER_KW_MIN_RELAY_LIGHTNING
 
 if TYPE_CHECKING:
     from .lnworker import LNWallet
     from .json_db import StoredDict
-    from .lnrouter import RouteEdge
+
 
 # channel flags
 CF_ANNOUNCE_CHANNEL = 0x01
@@ -140,6 +140,7 @@ state_transitions = [
     (cs.OPEN,     cs.WE_ARE_TOXIC),
     (cs.SHUTDOWN, cs.WE_ARE_TOXIC),
     (cs.REQUESTED_FCLOSE, cs.WE_ARE_TOXIC),
+    (cs.WE_ARE_TOXIC, cs.WE_ARE_TOXIC),
     #
     (cs.FORCE_CLOSING, cs.FORCE_CLOSING),  # allow multiple attempts
     (cs.FORCE_CLOSING, cs.CLOSED),
@@ -181,14 +182,14 @@ class HTLCWithStatus(NamedTuple):
 class AbstractChannel(Logger, ABC):
     storage: Union['StoredDict', dict]
     config: Dict[HTLCOwner, Union[LocalConfig, RemoteConfig]]
-    _sweep_info: Dict[str, Dict[str, 'SweepInfo']]
     lnworker: Optional['LNWallet']
     channel_id: bytes
     short_channel_id: Optional[ShortChannelID] = None
     funding_outpoint: Outpoint
     node_id: bytes  # note that it might not be the full 33 bytes; for OCB it is only the prefix
+    should_request_force_close: bool = False
     _state: ChannelState
-    sweep_address: str
+    _who_closed: Optional[int] = None  # HTLCOwner (1 or -1).  0 means "unknown"
 
     def set_short_channel_id(self, short_id: ShortChannelID) -> None:
         self.short_channel_id = short_id
@@ -222,17 +223,21 @@ class AbstractChannel(Logger, ABC):
     def get_state(self) -> ChannelState:
         return self._state
 
-    def is_funded(self):
+    def is_funded(self) -> bool:
         return self.get_state() >= ChannelState.FUNDED
 
-    def is_open(self):
+    def is_open(self) -> bool:
         return self.get_state() == ChannelState.OPEN
 
-    def is_closed(self):
+    def is_closed(self) -> bool:
         # the closing txid has been saved
         return self.get_state() >= ChannelState.CLOSING
 
-    def is_redeemed(self):
+    def is_closed_or_closing(self):
+        # related: self.get_state_for_GUI
+        return self.is_closed() or self.unconfirmed_closing_txid is not None
+
+    def is_redeemed(self) -> bool:
         return self.get_state() == ChannelState.REDEEMED
 
     def need_to_subscribe(self) -> bool:
@@ -265,7 +270,7 @@ class AbstractChannel(Logger, ABC):
     def save_funding_height(self, *, txid: str, height: int, timestamp: Optional[int]) -> None:
         self.storage['funding_height'] = txid, height, timestamp
 
-    def get_funding_height(self):
+    def get_funding_height(self) -> Optional[Tuple[str, int, Optional[int]]]:
         return self.storage.get('funding_height')
 
     def delete_funding_height(self):
@@ -274,41 +279,57 @@ class AbstractChannel(Logger, ABC):
     def save_closing_height(self, *, txid: str, height: int, timestamp: Optional[int]) -> None:
         self.storage['closing_height'] = txid, height, timestamp
 
-    def get_closing_height(self):
+    def get_closing_height(self) -> Optional[Tuple[str, int, Optional[int]]]:
         return self.storage.get('closing_height')
 
     def delete_closing_height(self):
         self.storage.pop('closing_height', None)
 
-    def create_sweeptxs_for_our_ctx(self, ctx):
-        return create_sweeptxs_for_our_ctx(chan=self, ctx=ctx, sweep_address=self.sweep_address)
+    def create_sweeptxs_for_our_ctx(self, ctx: Transaction) -> Dict[str, SweepInfo]:
+        return sweep_our_ctx(chan=self, ctx=ctx)
 
-    def create_sweeptxs_for_their_ctx(self, ctx):
-        return create_sweeptxs_for_their_ctx(chan=self, ctx=ctx, sweep_address=self.sweep_address)
+    def create_sweeptxs_for_their_ctx(self, ctx: Transaction) -> Dict[str, SweepInfo]:
+        return sweep_their_ctx(chan=self, ctx=ctx)
 
-    def is_backup(self):
+    def is_backup(self) -> bool:
         return False
 
-    def sweep_ctx(self, ctx: Transaction) -> Dict[str, SweepInfo]:
-        txid = ctx.txid()
-        if self._sweep_info.get(txid) is None:
-            our_sweep_info = self.create_sweeptxs_for_our_ctx(ctx)
-            their_sweep_info = self.create_sweeptxs_for_their_ctx(ctx)
-            if our_sweep_info:
-                self._sweep_info[txid] = our_sweep_info
-                self.logger.info(f'we (local) force closed')
-            elif their_sweep_info:
-                self._sweep_info[txid] = their_sweep_info
-                self.logger.info(f'they (remote) force closed.')
-            else:
-                self._sweep_info[txid] = {}
-                self.logger.info(f'not sure who closed.')
-        return self._sweep_info[txid]
-
-    def maybe_sweep_revoked_htlc(self, ctx: Transaction, htlc_tx: Transaction) -> Optional[SweepInfo]:
+    def get_local_scid_alias(self, *, create_new_if_needed: bool = False) -> Optional[bytes]:
         return None
 
-    def extract_preimage_from_htlc_txin(self, txin: TxInput) -> None:
+    def get_remote_scid_alias(self) -> Optional[bytes]:
+        return None
+
+    def get_remote_peer_sent_error(self) -> Optional[str]:
+        return None
+
+    def get_ctx_sweep_info(self, ctx: Transaction) -> Tuple[bool, Dict[str, SweepInfo]]:
+        our_sweep_info = self.create_sweeptxs_for_our_ctx(ctx)
+        their_sweep_info = self.create_sweeptxs_for_their_ctx(ctx)
+        if our_sweep_info:
+            sweep_info = our_sweep_info
+            who_closed = LOCAL
+        elif their_sweep_info:
+            sweep_info = their_sweep_info
+            who_closed = REMOTE
+        else:
+            sweep_info = {}
+            who_closed = 0
+        if self._who_closed != who_closed:  # mostly here to limit log spam
+            self._who_closed = who_closed
+            if who_closed == LOCAL:
+                self.logger.info(f'we (local) force closed')
+            elif who_closed == REMOTE:
+                self.logger.info(f'they (remote) force closed.')
+            else:
+                self.logger.info(f'not sure who closed. maybe co-op close?')
+        is_local_ctx = who_closed == LOCAL
+        return is_local_ctx, sweep_info
+
+    def maybe_sweep_htlcs(self, ctx: Transaction, htlc_tx: Transaction) -> Dict[str, SweepInfo]:
+        return {}
+
+    def extract_preimage_from_htlc_txin(self, txin: TxInput, *, is_deeply_mined: bool) -> None:
         return
 
     def update_onchain_state(self, *, funding_txid: str, funding_height: TxMinedInfo,
@@ -329,10 +350,14 @@ class AbstractChannel(Logger, ABC):
                 closing_height=closing_height,
                 keep_watching=keep_watching)
 
-    def update_unfunded_state(self):
+    def update_unfunded_state(self) -> None:
         self.delete_funding_height()
         self.delete_closing_height()
-        if self.get_state() in [ChannelState.PREOPENING, ChannelState.OPENING, ChannelState.FORCE_CLOSING] and self.lnworker:
+        if not self.lnworker:
+            return
+        chan_age = now() - self.storage.get('init_timestamp', 0)
+        state = self.get_state()
+        if state in [ChannelState.PREOPENING, ChannelState.OPENING, ChannelState.FORCE_CLOSING]:
             if self.is_initiator():
                 # set channel state to REDEEMED so that it can be removed manually
                 # to protect ourselves against a server lying by omission,
@@ -352,8 +377,28 @@ class AbstractChannel(Logger, ABC):
                             self.set_state(ChannelState.REDEEMED)
                             break
             else:
-                if self.lnworker and (now() - self.storage.get('init_timestamp', 0) > CHANNEL_OPENING_TIMEOUT):
+                if chan_age > CHANNEL_OPENING_TIMEOUT:
                     self.lnworker.remove_channel(self.channel_id)
+        elif self.is_zeroconf() and state in [ChannelState.OPEN, ChannelState.CLOSING, ChannelState.FORCE_CLOSING]:
+            assert self.storage.get('init_timestamp') is not None, "init_timestamp not set for zeroconf channel"
+            # handling zeroconf channels with no funding tx, can happen if broadcasting fails on LSP side
+            # or if the LSP did double spent the funding tx/never published it intentionally
+            # only remove a timed out OPEN channel if we are connected to the network to prevent removing it if we went
+            # offline before seeing the funding tx
+            if state != ChannelState.OPEN or chan_age > ZEROCONF_TIMEOUT and self.lnworker.network.is_connected():
+                # we delete the channel if its in closing state (either initiated manually by client or by LSP on failure)
+                # or if the channel is not seeing any funding tx after 10 minutes to prevent further usage (limit damage)
+                self.set_state(ChannelState.REDEEMED, force=True)
+                local_balance_sat = int(self.balance(LOCAL) // 1000)
+                if local_balance_sat > 0:
+                    self.logger.warning(
+                        f"we may have been scammed out of {local_balance_sat} sat by our "
+                        f"JIT provider: {self.lnworker.config.ZEROCONF_TRUSTED_NODE} or he didn't use our preimage")
+                    self.lnworker.config.ZEROCONF_TRUSTED_NODE = ''
+                self.lnworker.lnwatcher.unwatch_channel(self.get_funding_address(), self.funding_outpoint.to_str())
+                # remove remaining local transactions from the wallet, this will also remove child transactions (closing tx)
+                self.lnworker.lnwatcher.adb.remove_transaction(self.funding_outpoint.txid)
+                self.lnworker.remove_channel(self.channel_id)
 
     def update_funded_state(self, *, funding_txid: str, funding_height: TxMinedInfo) -> None:
         self.save_funding_height(txid=funding_txid, height=funding_height.height, timestamp=funding_height.timestamp)
@@ -364,6 +409,17 @@ class AbstractChannel(Logger, ABC):
         if self.get_state() == ChannelState.OPENING:
             if self.is_funding_tx_mined(funding_height):
                 self.set_state(ChannelState.FUNDED)
+        elif self.is_zeroconf() and funding_height.conf >= 3 and not self.should_request_force_close:
+            if not self.is_funding_tx_mined(funding_height):
+                # funding tx is invalid (invalid amount or address) we need to get rid of the channel again
+                self.should_request_force_close = True
+                if self.lnworker and self.node_id in self.lnworker.peers:
+                    # reconnect to trigger force close request
+                    self.lnworker.peers[self.node_id].close_and_cleanup()
+            else:
+                # remove zeroconf flag as we are now confirmed, this is to prevent an electrum server causing
+                # us to remove a channel later in update_unfunded_state by omitting its funding tx
+                self.remove_zeroconf_flag()
 
     def update_closed_state(self, *, funding_txid: str, funding_height: TxMinedInfo,
                             closing_txid: str, closing_height: TxMinedInfo, keep_watching: bool) -> None:
@@ -376,6 +432,8 @@ class AbstractChannel(Logger, ABC):
             conf = closing_height.conf
             if conf > 0:
                 self.set_state(ChannelState.CLOSED)
+                if self.lnworker:
+                    self.lnworker.wallet.txbatcher.set_password_future(None)
             else:
                 # we must not trust the server with unconfirmed transactions,
                 # because the state transition is irreversible. if the remote
@@ -390,7 +448,6 @@ class AbstractChannel(Logger, ABC):
                 # auto-remove redeemed backups
                 self.lnworker.remove_channel_backup(self.channel_id)
 
-
     @abstractmethod
     def is_initiator(self) -> bool:
         pass
@@ -400,11 +457,31 @@ class AbstractChannel(Logger, ABC):
         pass
 
     @abstractmethod
+    def is_zeroconf(self) -> bool:
+        pass
+
+    @abstractmethod
+    def remove_zeroconf_flag(self) -> None:
+        pass
+
+    @abstractmethod
     def is_funding_tx_mined(self, funding_height: TxMinedInfo) -> bool:
         pass
 
     @abstractmethod
     def get_funding_address(self) -> str:
+        pass
+
+    def get_funding_tx(self) -> Optional[Transaction]:
+        funding_txid = self.funding_outpoint.txid
+        return self.lnworker.lnwatcher.adb.get_transaction(funding_txid)
+
+    @abstractmethod
+    def get_sweep_address(self) -> str:
+        """Returns a wallet address we can use to sweep coins to.
+        It could be something static to the channel (fixed for its lifecycle),
+        or it might just ask the wallet now for an unused address.
+        """
         pass
 
     def get_state_for_GUI(self) -> str:
@@ -467,6 +544,21 @@ class AbstractChannel(Logger, ABC):
         """Returns channel capacity in satoshis, or None if unknown."""
         pass
 
+    @abstractmethod
+    def can_be_deleted(self) -> bool:
+        pass
+
+    @abstractmethod
+    def get_wallet_addresses_channel_might_want_reserved(self) -> Sequence[str]:
+        """Returns a list of addrs that the wallet should not use, to avoid address-reuse.
+        Typically, these addresses are wallet.is_mine, but that is not guaranteed,
+        in which case the wallet can just ignore those.
+        """
+        pass
+
+    def has_anchors(self) -> bool:
+        pass
+
 
 class ChannelBackup(AbstractChannel):
     """
@@ -482,7 +574,6 @@ class ChannelBackup(AbstractChannel):
         self.name = None
         self.cb = cb
         self.is_imported = isinstance(self.cb, ImportedChannelBackupStorage)
-        self._sweep_info = {}
         self.storage = {} # dummy storage
         self._state = ChannelState.OPENING
         self.node_id = cb.node_id if self.is_imported else cb.node_id_prefix
@@ -503,11 +594,23 @@ class ChannelBackup(AbstractChannel):
             self.logger.warning(
                 f"local_payment_pubkey missing from (old-type) channel backup. "
                 f"You should export and re-import a newer backup.")
+        multisig_funding_keypair = None
+        if multisig_funding_secret := cb.multisig_funding_privkey:
+            multisig_funding_keypair = Keypair(
+                privkey=multisig_funding_secret,
+                pubkey=ecc.ECPrivkey(multisig_funding_secret).get_public_key_bytes(),
+            )
         self.config[LOCAL] = LocalConfig.from_seed(
             channel_seed=cb.channel_seed,
             to_self_delay=cb.local_delay,
+            # there are three cases of backups:
+            # 1. legacy: payment_basepoint will be derived
+            # 2. static_remotekey: to_remote sweep not necessary due to wallet address
+            # 3. anchor outputs: sweep to_remote by deriving the key from the funding pubkeys
             static_remotekey=local_payment_pubkey,
+            multisig_key=multisig_funding_keypair,
             # dummy values
+            static_payment_key=None,
             dust_limit_sat=None,
             max_htlc_value_in_flight_msat=None,
             max_accepted_htlcs=None,
@@ -557,21 +660,22 @@ class ChannelBackup(AbstractChannel):
     def is_backup(self):
         return True
 
-    def get_local_scid_alias(self, *, create_new_if_needed: bool = False) -> Optional[bytes]:
-        return None
-
-    def get_remote_scid_alias(self) -> Optional[bytes]:
-        return None
-
     def create_sweeptxs_for_their_ctx(self, ctx):
-        return {}
+        funding_tx = self.get_funding_tx()
+        assert funding_tx
+        return sweep_their_ctx_to_remote_backup(chan=self, ctx=ctx, funding_tx=funding_tx)
 
     def create_sweeptxs_for_our_ctx(self, ctx):
         if self.is_imported:
-            return create_sweeptxs_for_our_ctx(chan=self, ctx=ctx, sweep_address=self.sweep_address)
+            return sweep_our_ctx(chan=self, ctx=ctx)
         else:
-            # backup from op_return
             return {}
+
+    def maybe_sweep_htlcs(self, ctx: Transaction, htlc_tx: Transaction) -> Dict[str, SweepInfo]:
+        return {}
+
+    def extract_preimage_from_htlc_txin(self, txin: TxInput, *, is_deeply_mined: bool) -> None:
+        return None
 
     def get_funding_address(self):
         return self.cb.funding_address
@@ -606,9 +710,17 @@ class ChannelBackup(AbstractChannel):
     def is_frozen_for_receiving(self) -> bool:
         return False
 
-    @property
-    def sweep_address(self) -> str:
+    def get_sweep_address(self) -> str:
         return self.lnworker.wallet.get_new_sweep_address_for_channel()
+
+    def has_anchors(self) -> Optional[bool]:
+        return None
+
+    def is_zeroconf(self) -> bool:
+        return False
+
+    def remove_zeroconf_flag(self) -> None:
+        pass
 
     def get_local_pubkey(self) -> bytes:
         cb = self.cb
@@ -624,6 +736,19 @@ class ChannelBackup(AbstractChannel):
         if self.get_state() == ChannelState.FUNDED:
             ret.append(ChanCloseOption.REQUEST_REMOTE_FCLOSE)
         return ret
+
+    def get_wallet_addresses_channel_might_want_reserved(self) -> Sequence[str]:
+        if self.is_imported:
+            # For v1 imported cbs, we have the local_payment_pubkey, which is
+            # directly used as p2wpkh() of static_remotekey channels.
+            # (for v0 imported cbs, the correct local_payment_pubkey is missing, and so
+            #  we might calculate a different address here, which might not be wallet.is_mine,
+            #  but that should be harmless)
+            our_payment_pubkey = self.config[LOCAL].payment_basepoint.pubkey
+            to_remote_address = make_commitment_output_to_remote_address(our_payment_pubkey, has_anchors=self.has_anchors())
+            return [to_remote_address]
+        else:  # on-chain backup
+            return []
 
 
 class Channel(AbstractChannel):
@@ -657,15 +782,14 @@ class Channel(AbstractChannel):
         self.onion_keys = state['onion_keys']  # type: Dict[int, bytes]
         self.data_loss_protect_remote_pcp = state['data_loss_protect_remote_pcp']
         self.hm = HTLCManager(log=state['log'], initial_feerate=initial_feerate)
-        self.unfulfilled_htlcs = state["unfulfilled_htlcs"]
+        self.unfulfilled_htlcs = state["unfulfilled_htlcs"]  # type: Dict[int, Tuple[str, Optional[str]]]
+        # ^ htlc_id -> onion_packet_hex, forwarding_key
         self._state = ChannelState[state['state']]
         self.peer_state = PeerState.DISCONNECTED
-        self._sweep_info = {}
         self._outgoing_channel_update = None  # type: Optional[bytes]
         self.revocation_store = RevocationStore(state["revocation_store"])
         self._can_send_ctx_updates = True  # type: bool
         self._receive_fail_reasons = {}  # type: Dict[int, (bytes, OnionRoutingFailure)]
-        self.should_request_force_close = False
         self.unconfirmed_closing_txid = None # not a state, only for GUI
         self.sent_channel_ready = False # no need to persist this, because channel_ready is re-sent in channel_reestablish
         self.sent_announcement_signatures = False
@@ -768,6 +892,21 @@ class Channel(AbstractChannel):
             net_addr = NetAddress.from_string(net_addr_str)
             yield LNPeerAddr(host=str(net_addr.host), port=net_addr.port, pubkey=self.node_id)
 
+    def save_remote_peer_sent_error(self, original_error: bytes):
+        # We save the original arbitrary text(/bytes) error, as received.
+        # The length is only implicitly limited by the BOLT-08 max msg size.
+        # Receiving an error usually results in the channel getting closed, so
+        # there is likely no need to store multiple errors. We only store one, and overwrite.
+        self.storage['remote_peer_sent_error'] = original_error.hex()
+
+    def get_remote_peer_sent_error(self) -> Optional[str]:
+        original_error = self.storage.get('remote_peer_sent_error')
+        if not original_error:
+            return None
+        err_bytes = bytes.fromhex(original_error)
+        safe_str = error_text_bytes_to_safe_str(err_bytes)   # note: truncates
+        return safe_str
+
     def get_outgoing_gossip_channel_update(self, *, scid: ShortChannelID = None) -> bytes:
         """
         scid: to be put into the channel_update message instead of the real scid, as this might be an scid alias
@@ -796,7 +935,7 @@ class Channel(AbstractChannel):
             timestamp=now(),
         )
         sighash = sha256d(chan_upd[2 + 64:])
-        sig = ecc.ECPrivkey(self.lnworker.node_keypair.privkey).sign(sighash, ecc.sig_string_from_r_and_s)
+        sig = ecc.ECPrivkey(self.lnworker.node_keypair.privkey).ecdsa_sign(sighash, sigencode=ecc.ecdsa_sig64_from_r_and_s)
         message_type, payload = decode_msg(chan_upd)
         payload['signature'] = sig
         chan_upd = encode_msg(message_type, **payload)
@@ -804,7 +943,7 @@ class Channel(AbstractChannel):
         self._outgoing_channel_update = chan_upd
         return chan_upd
 
-    def construct_channel_announcement_without_sigs(self) -> bytes:
+    def construct_channel_announcement_without_sigs(self) -> Tuple[bytes, bool]:
         bitcoin_keys = [
             self.config[REMOTE].multisig_key.pubkey,
             self.config[LOCAL].multisig_key.pubkey]
@@ -838,21 +977,31 @@ class Channel(AbstractChannel):
         channel_type = ChannelType(self.storage.get('channel_type'))
         return bool(channel_type & ChannelType.OPTION_ZEROCONF)
 
-    @property
-    def sweep_address(self) -> str:
+    def remove_zeroconf_flag(self) -> None:
+        if not self.is_zeroconf():
+            return
+        channel_type = ChannelType(self.storage.get('channel_type'))
+        self.storage['channel_type'] = channel_type & ~ChannelType.OPTION_ZEROCONF
+
+    def get_sweep_address(self) -> str:
         # TODO: in case of unilateral close with pending HTLCs, this address will be reused
-        addr = None
-        assert self.is_static_remotekey_enabled()
-        our_payment_pubkey = self.config[LOCAL].payment_basepoint.pubkey
-        addr = make_commitment_output_to_remote_address(our_payment_pubkey)
+        if self.has_anchors():
+            addr = self.lnworker.wallet.get_new_sweep_address_for_channel()
+        elif self.is_static_remotekey_enabled():
+            our_payment_pubkey = self.config[LOCAL].payment_basepoint.pubkey
+            addr = make_commitment_output_to_remote_address(our_payment_pubkey, has_anchors=self.has_anchors())
         if self.lnworker:
             assert self.lnworker.wallet.is_mine(addr)
         return addr
 
+    def has_anchors(self) -> bool:
+        channel_type = ChannelType(self.storage.get('channel_type'))
+        return bool(channel_type & ChannelType.OPTION_ANCHORS_ZERO_FEE_HTLC_TX)
+
     def get_wallet_addresses_channel_might_want_reserved(self) -> Sequence[str]:
         assert self.is_static_remotekey_enabled()
         our_payment_pubkey = self.config[LOCAL].payment_basepoint.pubkey
-        to_remote_address = make_commitment_output_to_remote_address(our_payment_pubkey)
+        to_remote_address = make_commitment_output_to_remote_address(our_payment_pubkey, has_anchors=self.has_anchors())
         return [to_remote_address]
 
     def get_feerate(self, subject: HTLCOwner, *, ctn: int) -> int:
@@ -905,18 +1054,21 @@ class Channel(AbstractChannel):
     def set_can_send_ctx_updates(self, b: bool) -> None:
         self._can_send_ctx_updates = b
 
-    def can_send_ctx_updates(self) -> bool:
-        """Whether we can send update_fee, update_*_htlc changes to the remote."""
+    def can_update_ctx(self, *, proposer: HTLCOwner) -> bool:
+        """Whether proposer is allowed to send commitment_signed, revoke_and_ack,
+        and update_* messages.
+        """
         if self.get_state() not in (ChannelState.OPEN, ChannelState.SHUTDOWN):
             return False
         if self.peer_state != PeerState.GOOD:
             return False
-        if not self._can_send_ctx_updates:
-            return False
+        if proposer == LOCAL:
+            if not self._can_send_ctx_updates:
+                return False
         return True
 
     def can_send_update_add_htlc(self) -> bool:
-        return self.can_send_ctx_updates() and self.is_open()
+        return self.can_update_ctx(proposer=LOCAL) and self.is_open()
 
     def is_frozen_for_sending(self) -> bool:
         if self.lnworker and self.lnworker.uses_trampoline() and not self.lnworker.is_trampoline_peer(self.node_id):
@@ -947,16 +1099,12 @@ class Channel(AbstractChannel):
         ctn = self.get_next_ctn(htlc_receiver)
         chan_config = self.config[htlc_receiver]
         if self.get_state() != ChannelState.OPEN:
-            raise PaymentFailure('Channel not open', self.get_state())
+            raise PaymentFailure(f"Channel not open. {self.get_state()!r}")
+        if not self.can_update_ctx(proposer=htlc_proposer):
+            raise PaymentFailure(f"cannot update channel. {self.get_state()!r} {self.peer_state!r}")
         if htlc_proposer == LOCAL:
-            if not self.can_send_ctx_updates():
-                raise PaymentFailure('Channel cannot send ctx updates')
             if not self.can_send_update_add_htlc():
                 raise PaymentFailure('Channel cannot add htlc')
-
-        # If proposer is LOCAL we apply stricter checks as that is behaviour we can control.
-        # This should lead to fewer disagreements (i.e. channels failing).
-        strict = (htlc_proposer == LOCAL)
 
         # check htlc raw value
         if not ignore_min_htlc_value:
@@ -965,29 +1113,55 @@ class Channel(AbstractChannel):
             if amount_msat < chan_config.htlc_minimum_msat:
                 raise PaymentFailure(f'HTLC value too small: {amount_msat} msat')
 
+        if self.htlc_slots_left(htlc_proposer) == 0:
+            raise PaymentFailure('Too many HTLCs already in channel')
+
+        if amount_msat > self.remaining_max_inflight(htlc_receiver, strict=False):
+            raise PaymentFailure(
+                f'HTLC value sum (sum of pending htlcs plus new htlc) '
+                f'would exceed max allowed: {chan_config.max_htlc_value_in_flight_msat/1000} sat')
+
         # check proposer can afford htlc
-        max_can_send_msat = self.available_to_spend(htlc_proposer, strict=strict)
+        max_can_send_msat = self.available_to_spend(htlc_proposer)
         if max_can_send_msat < amount_msat:
             raise PaymentFailure(f'Not enough balance. can send: {max_can_send_msat}, tried: {amount_msat}')
 
+    def htlc_slots_left(self, htlc_proposer: HTLCOwner) -> int:
         # check "max_accepted_htlcs"
-        # this is the loose check BOLT-02 specifies:
-        if len(self.hm.htlcs_by_direction(htlc_receiver, direction=RECEIVED, ctn=ctn)) + 1 > chan_config.max_accepted_htlcs:
-            raise PaymentFailure('Too many HTLCs already in channel')
-        # however, c-lightning is a lot stricter, so extra checks:
-        # https://github.com/ElementsProject/lightning/blob/4dcd4ca1556b13b6964a10040ba1d5ef82de4788/channeld/full_channel.c#L581
-        if strict:
-            max_concurrent_htlcs = min(self.config[htlc_proposer].max_accepted_htlcs,
-                                       self.config[htlc_receiver].max_accepted_htlcs)
-            if len(self.hm.htlcs(htlc_receiver, ctn=ctn)) + 1 > max_concurrent_htlcs:
-                raise PaymentFailure('Too many HTLCs already in channel')
+        htlc_receiver = htlc_proposer.inverted()
+        ctn = self.get_next_ctn(htlc_receiver)
+        chan_config = self.config[htlc_receiver]
+        # If proposer is LOCAL we apply stricter checks as that is behaviour we can control.
+        # This should lead to fewer disagreements (i.e. channels failing).
+        strict = (htlc_proposer == LOCAL)
+        if not strict:
+            # this is the loose check BOLT-02 specifies:
+            return chan_config.max_accepted_htlcs - len(self.hm.htlcs_by_direction(htlc_receiver, direction=RECEIVED, ctn=ctn))
+        else:
+            # however, c-lightning is a lot stricter, so extra checks:
+            # https://github.com/ElementsProject/lightning/blob/4dcd4ca1556b13b6964a10040ba1d5ef82de4788/channeld/full_channel.c#L581
+            max_concurrent_htlcs = min(
+                self.config[htlc_proposer].max_accepted_htlcs,
+                self.config[htlc_receiver].max_accepted_htlcs)
+            return max_concurrent_htlcs - len(self.hm.htlcs(htlc_receiver, ctn=ctn))
 
-        # check "max_htlc_value_in_flight_msat"
+    def remaining_max_inflight(self, htlc_receiver: HTLCOwner, *, strict: bool) -> int:
+        """
+        Checks max_htlc_value_in_flight_msat
+        strict = False -> how much we can accept according to BOLT2
+        strict = True -> how much the remote will accept to send to us (Eclair has stricter rules)
+        """
+        ctn = self.get_next_ctn(htlc_receiver)
         current_htlc_sum = htlcsum(self.hm.htlcs_by_direction(htlc_receiver, direction=RECEIVED, ctn=ctn).values())
-        if current_htlc_sum + amount_msat > chan_config.max_htlc_value_in_flight_msat:
-            raise PaymentFailure(f'HTLC value sum (sum of pending htlcs: {current_htlc_sum/1000} sat '
-                                 f'plus new htlc: {amount_msat/1000} sat) '
-                                 f'would exceed max allowed: {chan_config.max_htlc_value_in_flight_msat/1000} sat')
+        max_inflight = self.config[htlc_receiver].max_htlc_value_in_flight_msat
+        if strict and htlc_receiver == LOCAL:
+            # in order to send, eclair applies both local and remote max values
+            # https://github.com/ACINQ/eclair/blob/9b0c00a2a28d3ba6c7f3d01fbd2d8704ebbdc75d/eclair-core/src/main/scala/fr/acinq/eclair/channel/Commitments.scala#L503
+            max_inflight = min(
+                self.config[LOCAL].max_htlc_value_in_flight_msat,
+                self.config[REMOTE].max_htlc_value_in_flight_msat
+            )
+        return max_inflight - current_htlc_sum
 
     def can_pay(self, amount_msat: int, *, check_frozen=False) -> bool:
         """Returns whether we can add an HTLC of given value."""
@@ -1005,9 +1179,10 @@ class Channel(AbstractChannel):
         if check_frozen and self.is_frozen_for_receiving():
             return False
         try:
-            self._assert_can_add_htlc(htlc_proposer=REMOTE,
-                                      amount_msat=amount_msat,
-                                      ignore_min_htlc_value=ignore_min_htlc_value)
+            self._assert_can_add_htlc(
+                htlc_proposer=REMOTE,
+                amount_msat=amount_msat,
+                ignore_min_htlc_value=ignore_min_htlc_value)
         except PaymentFailure:
             return False
         return True
@@ -1015,6 +1190,8 @@ class Channel(AbstractChannel):
     def should_try_to_reestablish_peer(self) -> bool:
         if self.peer_state != PeerState.DISCONNECTED:
             return False
+        if self.should_request_force_close:
+            return True
         return ChannelState.PREOPENING < self._state < ChannelState.CLOSING
 
     def get_funding_address(self):
@@ -1051,11 +1228,8 @@ class Channel(AbstractChannel):
             htlc = attr.evolve(htlc, htlc_id=self.hm.get_next_htlc_id(REMOTE))
         with self.db_lock:
             self.hm.recv_htlc(htlc)
-            local_ctn = self.get_latest_ctn(LOCAL)
-            remote_ctn = self.get_latest_ctn(REMOTE)
             if onion_packet:
-                # TODO neither local_ctn nor remote_ctn are used anymore... no point storing them.
-                self.unfulfilled_htlcs[htlc.htlc_id] = local_ctn, remote_ctn, onion_packet.hex(), False
+                self.unfulfilled_htlcs[htlc.htlc_id] = onion_packet.hex(), None
 
         self.logger.info("receive_htlc")
         return htlc
@@ -1068,6 +1242,7 @@ class Channel(AbstractChannel):
         # TODO: when more channel types are supported, this method should depend on channel type
         next_remote_ctn = self.get_next_ctn(REMOTE)
         self.logger.info(f"sign_next_commitment. ctn={next_remote_ctn}")
+        assert not self.is_closed(), self.get_state()
 
         pending_remote_commitment = self.get_next_commitment(REMOTE)
         sig_64 = sign_and_get_sig_string(pending_remote_commitment, self.config[LOCAL], self.config[REMOTE])
@@ -1093,8 +1268,12 @@ class Channel(AbstractChannel):
                                                               commit=pending_remote_commitment,
                                                               ctx_output_idx=ctx_output_idx,
                                                               htlc=htlc)
-            sig = bfh(htlc_tx.sign_txin(0, their_remote_htlc_privkey))
-            htlc_sig = ecc.sig_string_from_der_sig(sig[:-1])
+            if self.has_anchors():
+                # we send a signature with the following sighash flags
+                # for the peer to be able to replace inputs and outputs
+                htlc_tx.inputs()[0].sighash = Sighash.ANYONECANPAY | Sighash.SINGLE
+            sig = htlc_tx.sign_txin(0, their_remote_htlc_privkey)
+            htlc_sig = ecc.ecdsa_sig64_from_der_sig(sig[:-1])
             htlcsigs.append((ctx_output_idx, htlc_sig))
         htlcsigs.sort()
         htlcsigs = [x[1] for x in htlcsigs]
@@ -1111,17 +1290,18 @@ class Channel(AbstractChannel):
         # TODO: when more channel types are supported, this method should depend on channel type
         next_local_ctn = self.get_next_ctn(LOCAL)
         self.logger.info(f"receive_new_commitment. ctn={next_local_ctn}, len(htlc_sigs)={len(htlc_sigs)}")
+        assert not self.is_closed(), self.get_state()
 
         assert len(htlc_sigs) == 0 or type(htlc_sigs[0]) is bytes
 
         pending_local_commitment = self.get_next_commitment(LOCAL)
-        preimage_hex = pending_local_commitment.serialize_preimage(0)
-        pre_hash = sha256d(bfh(preimage_hex))
-        if not ecc.verify_signature(self.config[REMOTE].multisig_key.pubkey, sig, pre_hash):
+        pre_hash = pending_local_commitment.serialize_preimage(0)
+        msg_hash = sha256d(pre_hash)
+        if not ECPubkey(self.config[REMOTE].multisig_key.pubkey).ecdsa_verify(sig, msg_hash):
             raise LNProtocolWarning(
                 f'failed verifying signature for our updated commitment transaction. '
                 f'sig={sig.hex()}. '
-                f'pre_hash={pre_hash.hex()}. '
+                f'msg_hash={msg_hash.hex()}. '
                 f'pubkey={self.config[REMOTE].multisig_key.pubkey}. '
                 f'ctx={pending_local_commitment.serialize()} '
             )
@@ -1161,16 +1341,19 @@ class Channel(AbstractChannel):
                                                           commit=ctx,
                                                           ctx_output_idx=ctx_output_idx,
                                                           htlc=htlc)
-        preimage_hex = htlc_tx.serialize_preimage(0)
-        pre_hash = sha256d(bfh(preimage_hex))
+        if self.has_anchors():
+            # peer sent us a signature for our ctx using anchor sighash flags
+            htlc_tx.inputs()[0].sighash = Sighash.ANYONECANPAY | Sighash.SINGLE
+        pre_hash = htlc_tx.serialize_preimage(0)
+        msg_hash = sha256d(pre_hash)
         remote_htlc_pubkey = derive_pubkey(self.config[REMOTE].htlc_basepoint.pubkey, pcp)
-        if not ecc.verify_signature(remote_htlc_pubkey, htlc_sig, pre_hash):
+        if not ECPubkey(remote_htlc_pubkey).ecdsa_verify(htlc_sig, msg_hash):
             raise LNProtocolWarning(
                 f'failed verifying HTLC signatures: {htlc=}, {htlc_direction=}. '
                 f'htlc_tx={htlc_tx.serialize()}. '
                 f'htlc_sig={htlc_sig.hex()}. '
                 f'remote_htlc_pubkey={remote_htlc_pubkey.hex()}. '
-                f'pre_hash={pre_hash.hex()}. '
+                f'msg_hash={msg_hash.hex()}. '
                 f'ctx={ctx.serialize()}. '
                 f'ctx_output_idx={ctx_output_idx}. '
                 f'ctn={ctn}. '
@@ -1180,11 +1363,13 @@ class Channel(AbstractChannel):
         data = self.config[LOCAL].current_htlc_signatures
         htlc_sigs = list(chunks(data, 64))
         htlc_sig = htlc_sigs[htlc_relative_idx]
-        remote_htlc_sig = ecc.der_sig_from_sig_string(htlc_sig) + Sighash.to_sigbytes(Sighash.ALL)
+        remote_sighash = Sighash.ALL if not self.has_anchors() else Sighash.ANYONECANPAY | Sighash.SINGLE
+        remote_htlc_sig = ecc.ecdsa_der_sig_from_ecdsa_sig64(htlc_sig) + Sighash.to_sigbytes(remote_sighash)
         return remote_htlc_sig
 
     def revoke_current_commitment(self):
         self.logger.info("revoke_current_commitment")
+        assert not self.is_closed(), self.get_state()
         new_ctn = self.get_latest_ctn(LOCAL)
         new_ctx = self.get_latest_commitment(LOCAL)
         if not self.signature_fits(new_ctx):
@@ -1198,6 +1383,7 @@ class Channel(AbstractChannel):
 
     def receive_revocation(self, revocation: RevokeAndAck):
         self.logger.info("receive_revocation")
+        assert not self.is_closed(), self.get_state()
         new_ctn = self.get_latest_ctn(REMOTE)
         cur_point = self.config[REMOTE].current_per_commitment_point
         derived_point = ecc.ECPrivkey(revocation.per_commitment_secret).get_public_key_bytes(compressed=True)
@@ -1223,39 +1409,77 @@ class Channel(AbstractChannel):
                     error_bytes, failure_message = None, None
                 self.lnworker.htlc_failed(self, htlc.payment_hash, htlc.htlc_id, error_bytes, failure_message)
 
-    def extract_preimage_from_htlc_txin(self, txin: TxInput) -> None:
+    def extract_preimage_from_htlc_txin(self, txin: TxInput, *, is_deeply_mined: bool) -> None:
+        from . import lnutil
+        from .crypto import ripemd
+        from .transaction import match_script_against_template, script_GetOp
+        from .lnonion import OnionRoutingFailure, OnionFailureCode
         witness = txin.witness_elements()
-        if len(witness) == 5:  # HTLC success tx
+        witness_script = witness[-1]
+        script_ops = [x for x in script_GetOp(witness_script)]
+        if match_script_against_template(witness_script, lnutil.WITNESS_TEMPLATE_OFFERED_HTLC, debug=False) \
+           or match_script_against_template(witness_script, lnutil.WITNESS_TEMPLATE_OFFERED_HTLC_ANCHORS, debug=False):
+            ripemd_payment_hash = script_ops[21][1]
+        elif match_script_against_template(witness_script, lnutil.WITNESS_TEMPLATE_RECEIVED_HTLC, debug=False) \
+           or match_script_against_template(witness_script, lnutil.WITNESS_TEMPLATE_RECEIVED_HTLC_ANCHORS, debug=False):
+            ripemd_payment_hash = script_ops[14][1]
+        else:
+            return
+        found = {}
+        for direction, htlc in itertools.chain(
+                self.hm.get_htlcs_in_oldest_unrevoked_ctx(REMOTE),
+                self.hm.get_htlcs_in_latest_ctx(REMOTE)):
+            if ripemd(htlc.payment_hash) == ripemd_payment_hash:
+                is_sent = direction == RECEIVED
+                found[htlc.htlc_id] = (htlc, is_sent)
+        for direction, htlc in itertools.chain(
+                self.hm.get_htlcs_in_oldest_unrevoked_ctx(LOCAL),
+                self.hm.get_htlcs_in_latest_ctx(LOCAL)):
+            if ripemd(htlc.payment_hash) == ripemd_payment_hash:
+                is_sent = direction == SENT
+                found[htlc.htlc_id] = (htlc, is_sent)
+        if not found:
+            return
+        if len(witness) == 5:    # HTLC success tx
             preimage = witness[3]
         elif len(witness) == 3:  # spending offered HTLC directly from ctx
             preimage = witness[1]
         else:
-            return
-        payment_hash = sha256(preimage)
-        for direction, htlc in itertools.chain(self.hm.get_htlcs_in_oldest_unrevoked_ctx(REMOTE),
-                                               self.hm.get_htlcs_in_latest_ctx(REMOTE)):
-            if htlc.payment_hash == payment_hash:
-                is_sent = direction == RECEIVED
-                break
-        else:
-            for direction, htlc in itertools.chain(self.hm.get_htlcs_in_oldest_unrevoked_ctx(LOCAL),
-                                                   self.hm.get_htlcs_in_latest_ctx(LOCAL)):
-                if htlc.payment_hash == payment_hash:
-                    is_sent = direction == SENT
-                    break
-            else:
+            preimage = None      # HTLC timeout tx
+        if preimage:
+            assert ripemd(sha256(preimage)) == ripemd_payment_hash
+            payment_hash = sha256(preimage)
+            if self.lnworker.get_preimage(payment_hash) is not None:
                 return
-        if self.lnworker.get_preimage(payment_hash) is None:
-            self.logger.info(f'found preimage for {payment_hash.hex()} in witness of length {len(witness)}')
+            # ^ note: log message text grepped for in regtests
+            self.logger.info(f"found preimage in witness of length {len(witness)}, for {payment_hash.hex()}")
+
+        # Mark the htlc as fulfilled or failed.
+        # If we forwarded this, this ensures that the success/failure is propagated back on the incoming channel.
+        # FIXME we only look at outgoing htlcs that have a corresponding output in the commitment tx,
+        #       however we should also look at those that do not. E.g. a small value htlc might not create an output
+        #       but we should still propagate back success or failure on the incoming link. And it is not just about
+        #       small value htlcs: even a large htlc might not appear in the outgoing channel's ctx, e.g. maybe it was
+        #       not committed yet - we should still make sure it gets removed on the incoming channel. (see #9631)
+        if preimage:
             self.lnworker.save_preimage(payment_hash, preimage)
-        info = self.lnworker.get_payment_info(payment_hash)
-        if info is not None and info.status != PR_PAID:
-            if is_sent:
-                self.lnworker.htlc_fulfilled(self, payment_hash, htlc.htlc_id)
-            else:
-                # FIXME
-                #self.lnworker.htlc_received(self, payment_hash)
-                pass
+            for htlc, is_sent in found.values():
+                if is_sent:
+                    self.lnworker.htlc_fulfilled(self, payment_hash, htlc.htlc_id)
+        else:
+            # htlc timeout tx
+            if not is_deeply_mined:
+                return
+            failure = OnionRoutingFailure(code=OnionFailureCode.PERMANENT_CHANNEL_FAILURE, data=b'')
+            for htlc, is_sent in found.values():
+                if is_sent:
+                    self.logger.info(f'htlc timeout tx: failing htlc {is_sent}')
+                    self.lnworker.htlc_failed(
+                        self,
+                        payment_hash=htlc.payment_hash,
+                        htlc_id=htlc.htlc_id,
+                        error_bytes=None,
+                        failure_message=failure)
 
     def balance(self, whose: HTLCOwner, *, ctx_owner=HTLCOwner.LOCAL, ctn: int = None) -> int:
         assert type(whose) is HTLCOwner
@@ -1285,8 +1509,8 @@ class Channel(AbstractChannel):
     def has_unsettled_htlcs(self) -> bool:
         return len(self.hm.htlcs(LOCAL)) + len(self.hm.htlcs(REMOTE)) > 0
 
-    def available_to_spend(self, subject: HTLCOwner, *, strict: bool = True) -> int:
-        """The usable balance of 'subject' in msat, after taking reserve and fees into
+    def available_to_spend(self, subject: HTLCOwner) -> int:
+        """The usable balance of 'subject' in msat, after taking reserve and fees (and anchors) into
         consideration. Note that fees (and hence the result) fluctuate even without user interaction.
         """
         assert type(subject) is HTLCOwner
@@ -1307,47 +1531,71 @@ class Channel(AbstractChannel):
                 feerate=feerate,
                 is_local_initiator=self.constraints.is_initiator,
                 round_to_sat=False,
+                has_anchors=self.has_anchors()
             )
             htlc_fee_msat = fee_for_htlc_output(feerate=feerate)
             htlc_trim_func = received_htlc_trim_threshold_sat if ctx_owner == receiver else offered_htlc_trim_threshold_sat
-            htlc_trim_threshold_msat = htlc_trim_func(dust_limit_sat=self.config[ctx_owner].dust_limit_sat, feerate=feerate) * 1000
-            if sender == initiator == LOCAL:  # see https://github.com/lightningnetwork/lightning-rfc/pull/740
+            htlc_trim_threshold_msat = htlc_trim_func(dust_limit_sat=self.config[ctx_owner].dust_limit_sat, feerate=feerate, has_anchors=self.has_anchors()) * 1000
+
+            # the sender cannot spend below its reserve
+            max_send_msat = sender_balance_msat - sender_reserve_msat
+
+            # reserve a fee spike buffer
+            # see https://github.com/lightningnetwork/lightning-rfc/pull/740
+            if sender == initiator == LOCAL:
                 fee_spike_buffer = calc_fees_for_commitment_tx(
                     num_htlcs=num_htlcs_in_ctx + int(not is_htlc_dust) + 1,
                     feerate=2 * feerate,
                     is_local_initiator=self.constraints.is_initiator,
                     round_to_sat=False,
-                )[sender]
-                max_send_msat = sender_balance_msat - sender_reserve_msat - fee_spike_buffer
-            else:
-                max_send_msat = sender_balance_msat - sender_reserve_msat - ctx_fees_msat[sender]
+                    has_anchors=self.has_anchors())[sender]
+                max_send_msat -= fee_spike_buffer
+            # we can't enforce the fee spike buffer on the remote party
+            elif sender == initiator == REMOTE:
+                max_send_msat -= ctx_fees_msat[sender]
+
+            # initiator pays for anchor outputs
+            if sender == initiator and self.has_anchors():
+                max_send_msat -= 2 * FIXED_ANCHOR_SAT * 1000
+
+            # handle the transaction fees for the HTLC transaction
             if is_htlc_dust:
+                # nobody pays additional HTLC transaction fees
                 return min(max_send_msat, htlc_trim_threshold_msat - 1)
             else:
+                # somebody has to pay for the additional HTLC transaction fees
                 if sender == initiator:
                     return max_send_msat - htlc_fee_msat
                 else:
-                    # the receiver is the initiator, so they need to be able to pay tx fees
-                    if receiver_balance_msat - receiver_reserve_msat - ctx_fees_msat[receiver] - htlc_fee_msat < 0:
+                    # check if the receiver can afford to pay for the HTLC transaction fees
+                    new_receiver_balance = receiver_balance_msat - receiver_reserve_msat - ctx_fees_msat[receiver] - htlc_fee_msat
+                    if self.has_anchors():
+                        new_receiver_balance -= 2 * FIXED_ANCHOR_SAT * 1000
+                    if new_receiver_balance < 0:
                         return 0
                     return max_send_msat
 
         max_send_msat = min(
-                            max(
-                                consider_ctx(ctx_owner=receiver, is_htlc_dust=True),
-                                consider_ctx(ctx_owner=receiver, is_htlc_dust=False),
-                            ),
-                            max(
-                                consider_ctx(ctx_owner=sender, is_htlc_dust=True),
-                                consider_ctx(ctx_owner=sender, is_htlc_dust=False),
-                            ),
+            max(
+                consider_ctx(ctx_owner=receiver, is_htlc_dust=True),
+                consider_ctx(ctx_owner=receiver, is_htlc_dust=False),
+            ),
+            max(
+                consider_ctx(ctx_owner=sender, is_htlc_dust=True),
+                consider_ctx(ctx_owner=sender, is_htlc_dust=False),
+            ),
         )
+
+        max_send_msat = min(max_send_msat, self.remaining_max_inflight(receiver, strict=True))
+        if self.htlc_slots_left(sender) == 0:
+            max_send_msat = 0
+
         max_send_msat = max(max_send_msat, 0)
         return max_send_msat
 
 
     def included_htlcs(self, subject: HTLCOwner, direction: Direction, ctn: int = None, *,
-                       feerate: int = None) -> Sequence[UpdateAddHtlc]:
+                       feerate: int = None) -> List[UpdateAddHtlc]:
         """Returns list of non-dust HTLCs for subject's commitment tx at ctn,
         filtered by direction (of HTLCs).
         """
@@ -1359,9 +1607,9 @@ class Channel(AbstractChannel):
             feerate = self.get_feerate(subject, ctn=ctn)
         conf = self.config[subject]
         if direction == RECEIVED:
-            threshold_sat = received_htlc_trim_threshold_sat(dust_limit_sat=conf.dust_limit_sat, feerate=feerate)
+            threshold_sat = received_htlc_trim_threshold_sat(dust_limit_sat=conf.dust_limit_sat, feerate=feerate, has_anchors=self.has_anchors())
         else:
-            threshold_sat = offered_htlc_trim_threshold_sat(dust_limit_sat=conf.dust_limit_sat, feerate=feerate)
+            threshold_sat = offered_htlc_trim_threshold_sat(dust_limit_sat=conf.dust_limit_sat, feerate=feerate, has_anchors=self.has_anchors())
         htlcs = self.hm.htlcs_by_direction(subject, direction, ctn=ctn).values()
         return list(filter(lambda htlc: htlc.amount_msat // 1000 >= threshold_sat, htlcs))
 
@@ -1408,10 +1656,26 @@ class Channel(AbstractChannel):
         ctn = self.get_oldest_unrevoked_ctn(subject)
         return self.get_commitment(subject, ctn=ctn)
 
-    def create_sweeptxs(self, ctn: int) -> List[Transaction]:
-        from .lnsweep import create_sweeptxs_for_watchtower
+    def create_sweeptxs_for_watchtower(self, ctn: int) -> List[Transaction]:
+        from .lnsweep import sweep_their_ctx_watchtower
+        from .fee_policy import FeePolicy
+        from .transaction import PartialTxOutput, PartialTransaction
         secret, ctx = self.get_secret_and_commitment(REMOTE, ctn=ctn)
-        return create_sweeptxs_for_watchtower(self, ctx, secret, self.sweep_address)
+        txs = []
+        txins = sweep_their_ctx_watchtower(self, ctx, secret)
+        fee_policy = FeePolicy('eta:2')
+        for txin in txins:
+            output_idx = txin.prevout.out_idx
+            value = ctx.outputs()[output_idx].value
+            tx_size_bytes = 121
+            fee = fee_policy.estimate_fee(tx_size_bytes, network=self.lnworker.network, allow_fallback_to_static_rates=True)
+            outvalue = value - fee
+            sweep_outputs = [PartialTxOutput.from_address_and_value(self.get_sweep_address(), outvalue)]
+            sweep_tx = PartialTransaction.from_io([txin], sweep_outputs, version=2)
+            sig = sweep_tx.sign_txin(0, txin.privkey)
+            txin.witness = txin.make_witness(sig)
+            txs.append(sweep_tx)
+        return txs
 
     def get_oldest_unrevoked_ctn(self, subject: HTLCOwner) -> int:
         return self.hm.ctn_oldest_unrevoked(subject)
@@ -1432,7 +1696,7 @@ class Channel(AbstractChannel):
         Action must be initiated by LOCAL.
         """
         self.logger.info("settle_htlc")
-        assert self.can_send_ctx_updates(), f"cannot update channel. {self.get_state()!r} {self.peer_state!r}"
+        assert self.can_update_ctx(proposer=LOCAL), f"cannot update channel. {self.get_state()!r} {self.peer_state!r}"
         htlc = self.hm.get_htlc_by_id(REMOTE, htlc_id)
         if htlc.payment_hash != sha256(preimage):
             raise Exception("incorrect preimage for HTLC")
@@ -1449,6 +1713,7 @@ class Channel(AbstractChannel):
         Action must be initiated by REMOTE.
         """
         self.logger.info("receive_htlc_settle")
+        assert self.can_update_ctx(proposer=REMOTE), f"cannot update channel. {self.get_state()!r} {self.peer_state!r}"
         htlc = self.hm.get_htlc_by_id(LOCAL, htlc_id)
         if htlc.payment_hash != sha256(preimage):
             raise RemoteMisbehaving("received incorrect preimage for HTLC")
@@ -1461,7 +1726,7 @@ class Channel(AbstractChannel):
         Action must be initiated by LOCAL.
         """
         self.logger.info("fail_htlc")
-        assert self.can_send_ctx_updates(), f"cannot update channel. {self.get_state()!r} {self.peer_state!r}"
+        assert self.can_update_ctx(proposer=LOCAL), f"cannot update channel. {self.get_state()!r} {self.peer_state!r}"
         with self.db_lock:
             self.hm.send_fail(htlc_id)
 
@@ -1472,6 +1737,7 @@ class Channel(AbstractChannel):
         Action must be initiated by REMOTE.
         """
         self.logger.info("receive_fail_htlc")
+        assert self.can_update_ctx(proposer=REMOTE), f"cannot update channel. {self.get_state()!r} {self.peer_state!r}"
         with self.db_lock:
             self.hm.recv_fail(htlc_id)
         self._receive_fail_reasons[htlc_id] = (error_bytes, reason)
@@ -1499,14 +1765,15 @@ class Channel(AbstractChannel):
             num_htlcs=num_htlcs_in_ctx,
             feerate=feerate,
             is_local_initiator=self.constraints.is_initiator,
+            has_anchors=self.has_anchors()
         )
         remainder = sender_balance_msat - sender_reserve_msat - ctx_fees_msat[sender]
         if remainder < 0:
             raise Exception(f"Cannot update_fee. {sender} tried to update fee but they cannot afford it. "
                             f"Their balance would go below reserve: {remainder} msat missing.")
+        assert self.can_update_ctx(proposer=LOCAL if from_us else REMOTE), f"cannot update channel. {self.get_state()!r} {self.peer_state!r}. {from_us=}"
         with self.db_lock:
             if from_us:
-                assert self.can_send_ctx_updates(), f"cannot update channel. {self.get_state()!r} {self.peer_state!r}"
                 self.hm.send_update_fee(feerate)
             else:
                 self.hm.recv_update_fee(feerate)
@@ -1541,13 +1808,15 @@ class Channel(AbstractChannel):
                     remote_htlc_pubkey=other_htlc_pubkey,
                     local_htlc_pubkey=this_htlc_pubkey,
                     payment_hash=htlc.payment_hash,
-                    cltv_abs=htlc.cltv_abs), htlc))
+                    cltv_abs=htlc.cltv_abs,
+                    has_anchors=self.has_anchors()), htlc))
         # note: maybe flip initiator here for fee purposes, we want LOCAL and REMOTE
         #       in the resulting dict to correspond to the to_local and to_remote *outputs* of the ctx
         onchain_fees = calc_fees_for_commitment_tx(
             num_htlcs=len(htlcs),
             feerate=feerate,
             is_local_initiator=self.constraints.is_initiator == (subject == LOCAL),
+            has_anchors=self.has_anchors(),
         )
         assert self.is_static_remotekey_enabled()
         payment_pubkey = other_config.payment_basepoint.pubkey
@@ -1569,22 +1838,27 @@ class Channel(AbstractChannel):
             dust_limit_sat=this_config.dust_limit_sat,
             fees_per_participant=onchain_fees,
             htlcs=htlcs,
+            has_anchors=self.has_anchors()
         )
 
     def make_closing_tx(self, local_script: bytes, remote_script: bytes,
                         fee_sat: int, *, drop_remote = False) -> Tuple[bytes, PartialTransaction]:
         """ cooperative close """
         _, outputs = make_commitment_outputs(
-                fees_per_participant={
-                    LOCAL:  fee_sat * 1000 if     self.constraints.is_initiator else 0,
-                    REMOTE: fee_sat * 1000 if not self.constraints.is_initiator else 0,
-                },
-                local_amount_msat=self.balance(LOCAL),
-                remote_amount_msat=self.balance(REMOTE) if not drop_remote else 0,
-                local_script=local_script.hex(),
-                remote_script=remote_script.hex(),
-                htlcs=[],
-                dust_limit_sat=self.config[LOCAL].dust_limit_sat)
+            fees_per_participant={
+                LOCAL: fee_sat * 1000 if self.constraints.is_initiator else 0,
+                REMOTE: fee_sat * 1000 if not self.constraints.is_initiator else 0,
+            },
+            local_amount_msat=self.balance(LOCAL),
+            remote_amount_msat=self.balance(REMOTE) if not drop_remote else 0,
+            local_script=local_script,
+            remote_script=remote_script,
+            htlcs=[],
+            dust_limit_sat=self.config[LOCAL].dust_limit_sat,
+            has_anchors=self.has_anchors(),
+            local_anchor_script=None,
+            remote_anchor_script=None,
+        )
 
         closing_tx = make_closing_tx(self.config[LOCAL].multisig_key.pubkey,
                                      self.config[REMOTE].multisig_key.pubkey,
@@ -1593,27 +1867,27 @@ class Channel(AbstractChannel):
                                      funding_sat=self.constraints.capacity,
                                      outputs=outputs)
 
-        der_sig = bfh(closing_tx.sign_txin(0, self.config[LOCAL].multisig_key.privkey))
-        sig = ecc.sig_string_from_der_sig(der_sig[:-1])
+        der_sig = closing_tx.sign_txin(0, self.config[LOCAL].multisig_key.privkey)
+        sig = ecc.ecdsa_sig64_from_der_sig(der_sig[:-1])
         return sig, closing_tx
 
     def signature_fits(self, tx: PartialTransaction) -> bool:
         remote_sig = self.config[LOCAL].current_commitment_signature
-        preimage_hex = tx.serialize_preimage(0)
-        msg_hash = sha256d(bfh(preimage_hex))
+        pre_hash = tx.serialize_preimage(0)
+        msg_hash = sha256d(pre_hash)
         assert remote_sig
-        res = ecc.verify_signature(self.config[REMOTE].multisig_key.pubkey, remote_sig, msg_hash)
+        res = ECPubkey(self.config[REMOTE].multisig_key.pubkey).ecdsa_verify(remote_sig, msg_hash)
         return res
 
     def force_close_tx(self) -> PartialTransaction:
         tx = self.get_latest_commitment(LOCAL)
         assert self.signature_fits(tx)
-        tx.sign({self.config[LOCAL].multisig_key.pubkey.hex(): (self.config[LOCAL].multisig_key.privkey, True)})
+        tx.sign({self.config[LOCAL].multisig_key.pubkey: self.config[LOCAL].multisig_key.privkey})
         remote_sig = self.config[LOCAL].current_commitment_signature
-        remote_sig = ecc.der_sig_from_sig_string(remote_sig) + Sighash.to_sigbytes(Sighash.ALL)
+        remote_sig = ecc.ecdsa_der_sig_from_ecdsa_sig64(remote_sig) + Sighash.to_sigbytes(Sighash.ALL)
         tx.add_signature_to_txin(txin_idx=0,
-                                 signing_pubkey=self.config[REMOTE].multisig_key.pubkey.hex(),
-                                 sig=remote_sig.hex())
+                                 signing_pubkey=self.config[REMOTE].multisig_key.pubkey,
+                                 sig=remote_sig)
         assert tx.is_complete()
         return tx
 
@@ -1629,21 +1903,26 @@ class Channel(AbstractChannel):
             if not self.has_unsettled_htlcs():
                 ret.append(ChanCloseOption.COOP_CLOSE)
                 ret.append(ChanCloseOption.REQUEST_REMOTE_FCLOSE)
+        if self.get_state() == ChannelState.WE_ARE_TOXIC:
+            ret.append(ChanCloseOption.REQUEST_REMOTE_FCLOSE)
         if not self.is_closed() or self.get_state() == ChannelState.REQUESTED_FCLOSE:
             ret.append(ChanCloseOption.LOCAL_FCLOSE)
         assert not (self.get_state() == ChannelState.WE_ARE_TOXIC and ChanCloseOption.LOCAL_FCLOSE in ret), "local force-close unsafe if we are toxic"
         return ret
 
-    def maybe_sweep_revoked_htlc(self, ctx: Transaction, htlc_tx: Transaction) -> Optional[SweepInfo]:
+    def maybe_sweep_htlcs(self, ctx: Transaction, htlc_tx: Transaction) -> Dict[str, SweepInfo]:
         # look at the output address, check if it matches
-        return create_sweeptx_for_their_revoked_htlc(self, ctx, htlc_tx, self.sweep_address)
+        d = sweep_their_htlctx_justice(self, ctx, htlc_tx)
+        d2 = sweep_our_htlctx(self, ctx, htlc_tx)
+        d.update(d2)
+        return d
 
     def has_pending_changes(self, subject: HTLCOwner) -> bool:
         next_htlcs = self.hm.get_htlcs_in_next_ctx(subject)
         latest_htlcs = self.hm.get_htlcs_in_latest_ctx(subject)
         return not (next_htlcs == latest_htlcs and self.get_next_feerate(subject) == self.get_latest_feerate(subject))
 
-    def should_be_closed_due_to_expiring_htlcs(self, local_height) -> bool:
+    def should_be_closed_due_to_expiring_htlcs(self, local_height: int) -> bool:
         htlcs_we_could_reclaim = {}  # type: Dict[Tuple[Direction, int], UpdateAddHtlc]
         # If there is a received HTLC for which we already released the preimage
         # but the remote did not revoke yet, and the CLTV of this HTLC is dangerously close
@@ -1671,12 +1950,12 @@ class Channel(AbstractChannel):
                 if htlc.cltv_abs + offered_htlc_deadline_delta > local_height:
                     continue
                 htlcs_we_could_reclaim[(SENT, htlc_id)] = htlc
-
-        total_value_sat = sum([htlc.amount_msat // 1000 for htlc in htlcs_we_could_reclaim.values()])
-        num_htlcs = len(htlcs_we_could_reclaim)
-        min_value_worth_closing_channel_over_sat = max(num_htlcs * 10 * self.config[REMOTE].dust_limit_sat,
-                                                       500_000)
-        return total_value_sat > min_value_worth_closing_channel_over_sat
+        # Note: previously we used a threshold concept, "min_value_worth_closing_channel_over_sat", and
+        #       only force-closed the channel if the total value of these expiring htlcs was large enough.
+        #       However, if we are forwarding, and an outgoing htlc expires, we should always close
+        #       the outgoing channel (regardless of htlc value), so that we can propagate back the
+        #       removal of the htlc in the incoming channel.
+        return len(htlcs_we_could_reclaim) > 0
 
     def is_funding_tx_mined(self, funding_height):
         funding_txid = self.funding_outpoint.txid

@@ -43,7 +43,9 @@ Item {
 
         // Android based send dialog if on android
         var scanner = app.scanDialog.createObject(mainView, {
-            hint: qsTr('Scan an Invoice, an Address, an LNURL-pay, a PSBT or a Channel backup'),
+            hint: Daemon.currentWallet.isLightning
+                ? qsTr('Scan an Invoice, an Address, an LNURL-pay, a PSBT or a Channel Backup')
+                : qsTr('Scan an Invoice, an Address, an LNURL-pay or a PSBT')
         })
         scanner.onFound.connect(function() {
             var data = scanner.scanData
@@ -52,7 +54,7 @@ Item {
                 app.stack.push(Qt.resolvedUrl('TxDetails.qml'), { rawtx: data })
             } else if (Daemon.currentWallet.isValidChannelBackup(data)) {
                 var dialog = app.messageDialog.createObject(app, {
-                    title: qsTr('Import Channel backup?'),
+                    title: qsTr('Import Channel Backup?'),
                     yesno: true
                 })
                 dialog.accepted.connect(function() {
@@ -96,12 +98,13 @@ Item {
                 ? ''
                 : [qsTr('Warning: Some data (prev txs / "full utxos") was left out of the QR code as it would not fit.'),
                    qsTr('This might cause issues if signing offline.'),
-                   qsTr('As a workaround, copy to clipboard or use the Share option instead.')].join(' ')
+                   qsTr('As a workaround, copy to clipboard or use the Share option instead.')].join(' '),
+            tx_label: data[3]
         })
         dialog.open()
     }
 
-    function payOnchain(invoice) {
+    function payOnchain(invoicedialog, invoice) {
         var dialog = confirmPaymentDialog.createObject(mainView, {
                 address: invoice.address,
                 satoshis: invoice.amountOverride.isEmpty
@@ -111,6 +114,8 @@ Item {
         })
         var canComplete = !Daemon.currentWallet.isWatchOnly && Daemon.currentWallet.canSignWithoutCosigner
         dialog.accepted.connect(function() {
+            if (invoice.canSave)
+                invoice.saveInvoice()
             if (!canComplete) {
                 if (Daemon.currentWallet.isWatchOnly) {
                     dialog.finalizer.saveOrShow()
@@ -118,15 +123,51 @@ Item {
                     dialog.finalizer.sign()
                 }
             } else {
+                // store txid in invoicedialog so the dialog can detect broadcast success
+                invoicedialog.broadcastTxid = dialog.finalizer.finalizedTxid
                 dialog.finalizer.signAndSend()
             }
         })
         dialog.open()
     }
 
-    function createRequest(lightning_only, reuse_address) {
+    function createRequest(lightning, reuse_address) {
         var qamt = Config.unitsToSats(_request_amount)
-        Daemon.currentWallet.createRequest(qamt, _request_description, _request_expiry, lightning_only, reuse_address)
+        Daemon.currentWallet.createRequest(qamt, _request_description, _request_expiry, lightning, reuse_address)
+    }
+
+    function startSweep() {
+        var dialog = sweepDialog.createObject(app)
+        dialog.accepted.connect(function() {
+            var finalizerDialog = confirmSweepDialog.createObject(mainView, {
+                privateKeys: dialog.privateKeys,
+                message: qsTr('Sweep transaction'),
+                showOptions: false,
+                amountLabelText: qsTr('Total sweep amount'),
+                sendButtonText: Daemon.currentWallet.isWatchOnly
+                    ? qsTr('Sweep...')
+                    : qsTr('Sweep')
+            })
+            finalizerDialog.accepted.connect(function() {
+                if (Daemon.currentWallet.isWatchOnly) {
+                    var confirmdialog = app.messageDialog.createObject(mainView, {
+                        title: qsTr('Confirm Sweep'),
+                        text: qsTr('Current wallet is watch-only. You might not be able to spend from these addresses.\n\nAre you sure?'),
+                        yesno: true
+                    })
+                    confirmdialog.accepted.connect(function() {
+                        finalizerDialog.finalizer.send()
+                        close()
+                    })
+                    confirmdialog.open()
+                    return
+                }
+                console.log("Sending sweep transaction")
+                finalizerDialog.finalizer.send()
+            })
+            finalizerDialog.open()
+        })
+        dialog.open()
     }
 
     property QtObject menu: Menu {
@@ -180,6 +221,18 @@ Item {
                 onTriggered: {
                     var dialog = app.signVerifyMessageDialog.createObject(app)
                     dialog.open()
+                    menu.deselect()
+                }
+            }
+        }
+
+        MenuItem {
+            icon.color: action.enabled ? 'transparent' : Material.iconDisabledColor
+            icon.source: '../../icons/sweep.png'
+            action: Action {
+                text: qsTr('Sweep key(s)')
+                onTriggered: {
+                    startSweep()
                     menu.deselect()
                 }
             }
@@ -401,6 +454,7 @@ Item {
     Connections {
         target: Daemon
         function onWalletLoaded() {
+            infobanner.hide() // start hidden when switching wallets
             if (_intentUri) {
                 invoiceParser.recipient = _intentUri
                 _intentUri = ''
@@ -439,7 +493,7 @@ Item {
             var dialog = app.messageDialog.createObject(app, {
                 title: qsTr('Error'),
                 iconSource: Qt.resolvedUrl('../../icons/warning.png'),
-                text: message
+                text: message ? message : qsTr('Payment failed')
             })
             dialog.open()
         }
@@ -450,6 +504,27 @@ Item {
                 text: message
             })
             dialog.open()
+        }
+        function onBalanceChanged() {
+            // ln low reserve warning
+            if (Daemon.currentWallet.isLowReserve) {
+                var message = [
+                    qsTr('You do not have enough on-chain funds to protect your Lightning channels.'),
+                    qsTr('You should have at least %1 on-chain in order to be able to sweep channel outputs.').arg(Config.formatSats(Config.lnUtxoReserve) + ' ' + Config.baseUnit)
+                ].join(' ')
+                infobanner.show(message, function() {
+                    var dialog = app.messageDialog.createObject(app, {
+                        text: message + '\n\n' + qsTr('Do you want to perform a swap?'),
+                        yesno: true
+                    })
+                    dialog.accepted.connect(function() {
+                        app.startSwap()
+                    })
+                    dialog.open()
+                })
+            } else {
+                infobanner.hide()
+            }
         }
     }
 
@@ -473,7 +548,7 @@ Item {
                     }
                 }
                 if (invoice.invoiceType == Invoice.OnchainInvoice) {
-                    payOnchain(invoice)
+                    payOnchain(_invoiceDialog, invoice)
                 } else if (invoice.invoiceType == Invoice.LightningInvoice) {
                     if (lninvoiceButPayOnchain) {
                         var dialog = app.messageDialog.createObject(mainView, {
@@ -481,7 +556,7 @@ Item {
                             yesno: true
                         })
                         dialog.accepted.connect(function() {
-                            payOnchain(invoice)
+                            payOnchain(_invoiceDialog, invoice)
                         })
                         dialog.open()
                     } else {
@@ -508,13 +583,21 @@ Item {
             width: parent.width
             height: parent.height
 
-            onTxFound: {
+            onTxFound: (data) => {
                 app.stack.push(Qt.resolvedUrl('TxDetails.qml'), { rawtx: data })
                 close()
             }
-            onChannelBackupFound: {
+            onChannelBackupFound: (data) => {
+                if (!Daemon.currentWallet.isLightning) {
+                    var dialog = app.messageDialog.createObject(app, {
+                        title: qsTr('Cannot import Channel Backup, Lightning not enabled.')
+                    })
+                    dialog.open()
+                    return
+                }
+
                 var dialog = app.messageDialog.createObject(app, {
-                    title: qsTr('Import Channel backup?'),
+                    title: qsTr('Import Channel Backup?'),
                     yesno: true
                 })
                 dialog.accepted.connect(function() {
@@ -542,7 +625,7 @@ Item {
                 _request_amount = _receiveDetailsDialog.amount
                 _request_description = _receiveDetailsDialog.description
                 _request_expiry = _receiveDetailsDialog.expiry
-                createRequest(false, false)
+                createRequest(_receiveDetailsDialog.isLightning, false)
             }
             onRejected: {
                 console.log('rejected')
@@ -557,6 +640,15 @@ Item {
             width: parent.width
             height: parent.height
 
+            onRequestPaid: {
+                close()
+                if (isLightning) {
+                    app.stack.push(Qt.resolvedUrl('LightningPaymentDetails.qml'), {'key': key})
+                } else {
+                    let paidTxid = getPaidTxid()
+                    app.stack.push(Qt.resolvedUrl('TxDetails.qml'), {'txid': paidTxid})
+                }
+            }
             onClosed: destroy()
         }
     }
@@ -590,11 +682,36 @@ Item {
                     }
                     _confirmPaymentDialog.destroy()
                 }
+                onSignError: (message) => {
+                    var dialog = app.messageDialog.createObject(mainView, {
+                        title: qsTr('Error'),
+                        text: [qsTr('Could not sign tx'), message].join('\n\n'),
+                        iconSource: '../../../icons/warning.png'
+                    })
+                    dialog.open()
+                }
             }
+
             // TODO: lingering confirmPaymentDialogs can raise exceptions in
             // the child finalizer when currentWallet disappears, but we need
             // it long enough for the finalizer to finish..
             // onClosed: destroy()
+        }
+    }
+
+    Component {
+        id: confirmSweepDialog
+        ConfirmTxDialog {
+            id: _confirmSweepDialog
+
+            property string privateKeys
+            title: qsTr('Confirm Sweep')
+            satoshis: MAX
+            finalizer: SweepFinalizer {
+                wallet: Daemon.currentWallet
+                canRbf: true
+                privateKeys: _confirmSweepDialog.privateKeys
+            }
         }
     }
 
@@ -621,6 +738,13 @@ Item {
     Component {
         id: exportTxDialog
         ExportTxDialog {
+            onClosed: destroy()
+        }
+    }
+
+    Component {
+        id: sweepDialog
+        SweepDialog {
             onClosed: destroy()
         }
     }

@@ -1,4 +1,318 @@
-# Release 4.5.0 (in beta/rc)
+# Release 4.6.0 (in beta/rc, June 2025)
+ * A 'Terms of Use' screen was added to the install wizard. While the
+   licence remains unchanged, we ask users to agree with the fact that
+   we are not a custodial service or a money transmitter. The Terms of
+   Use screen also makes it clear that all issues are to be resolved
+   in public, and that there is no user support via private channels.
+ * Nostr support: (using new dependency: electrum-aionostr)
+   Electrum now uses Nostr in the context of submarine swaps,
+   and in several plugins. Electrum will not connect to Nostr
+   by default, only if required.
+ * Submarine swaps over Nostr: The Electrum client will connect to
+   Nostr in order to discover submarine swap providers, and to perform
+   related RPCs. This means that:
+    - Anyone can become a swap provider (you need to run an Electrum
+      daemon with the 'swapserver' plugin). Submarine swap providers
+      advertise their fees and their liquidity on Nostr.
+      See https://electrum.readthedocs.io/en/latest/swapserver.html
+      for set-up documentation.
+    - Submarine swap providers do not need to provide an HTTP
+      endpoint, since RPCs are performed via Nostr. They also do not
+      need to have public lightning channels.
+    - Because a decentralized service needs to be trustless, the
+      option to perform zero-confirmation swaps has been removed from
+      Electrum.
+    Note that Electrum connections to Nostr relays are only initiated
+    when the user uses the swap service, and the nostr public key used
+    by the client is ephemeral. In contrast, swap providers use a
+    persisted identity.
+ * Third-party plugins:
+   - Electrum supports the installation of plugins distributed by
+     third-parties as ZIP files. While it has long been possible to
+     install third-party plugins when running Electrum from python
+     sources, the same is now possible when using desktop binaries
+     (Windows, MacOS, Linux). Third-party plugins are installed as ZIP
+     files in the user's electrum data directory.
+   - In order to prevent plugin installation by malware, third-party
+     plugins can only be enabled if the user enters a plugin
+     authorization password (distinct from the wallet password).
+     Setting up that plugin authorization password requires
+     administrator permissions on the local machine; a
+     password-derived public key must be written in the system.
+ * Lightning:
+   - Anchor channels (#9264): Newly created channels use
+       anchor commitments by default. Since sweeping outputs from anchor
+       channels may require external UTXOs, lightning can no longer be
+       enabled in wallets that do not have a software keystore (hardware
+       wallets, watching-only wallets).  Existing wallets that are in that
+       situation cannot create new channels.
+   - wallets with anchor channels must always have utxos available (#9536)
+   - support added for onion messages (only CLI for now) (#9039)
+   - lots of fixes and improvements (#8857, #8547, #9700, #9083, ...)
+ * Qt Desktop GUI:
+   - migrate from Qt5 to Qt6 (#9189)
+   - new: screenshot "protection" on Windows (#9898). Inspired by Windows
+     Recall, by default screenshots will contain black rectangles in
+     place of the Electrum windows, to try to avoid leaking secret keys.
+     This is opt-out using a config variable.
+   - exposed option to connect to only a single server (--oneserver)
+   - Wallet file encryption:
+     - Non-multisig hardware wallet files can now be encrypted with
+       either using the hardware device or (new) a password. (#5561)
+     - The option to have a password-protected wallet without file
+       encryption has been removed from the Qt GUI. It is still possible
+       to create such a wallet using the command line.
+   - Wallet unlocking:
+     - Wallets can be unlocked in the Qt GUI. When a password-protected
+       wallet is unlocked, its password is kept in memory, and signing
+       transactions will not require to enter the password. The unlocked
+       state is rendered by the 'open lock' icon in the status bar.
+     - If a wallet needs to sweep anchor channel outputs using extra
+       UTXOs, the operations will be performed without requiring the
+       user password if the wallet is unlocked. If the wallet is locked,
+       the status bar will show a 'password required' button.
+   - Transaction batching: When creating a new payment, if the
+     output can be added to an existing mempool transaction, the 'New
+     transaction' window will show a drop-down menu, proposing a list of
+     transactions that can be batched with the current payment. This
+     replaces the previous 'batch' option checkbox, and gives more
+     control to the user.
+   - Keystore enabling/disabling (Qt):
+     - It is now possible to add a seed
+       to an existing watching-only wallet, or to a keystore within a
+       multisig wallet. Similarly, it is possible to pair a watching-only
+       keystore with a hardware device. These operations are performed
+       from the 'Wallet Information' dialog.
+   - Lightning address contacts:
+     - It is now possible to create contacts with (lnurl type) lightning
+       addresses as payment identifier.
+   - show warnings on wallet close if there are sensitive pending operations,
+     e.g. when in the middle of doing a swap (#9715)
+ * Accounting rules: In order to properly handle on-chain transactions
+   created by lightning channel force closures, we consider that funds
+   successfully redeemed from a script with several possible
+   recipients have never left the final recipient's wallet. This
+   avoids having to write balance changes that are cancelled
+   later. The corresponding addresses are rendered in the GUI as
+   'accounting addresses' (in orange).
+ * New plugins:
+   - Nostr Wallet Connect: This plugin allows remote control of
+     Electrum lightning wallets via Nostr NIP-47. (#9675)
+   - Nostr Cosigner: This plugin facilitates the exchange of
+     PSBTs between cosigners of a multisig wallet. It replaces the
+     former 'Cosigner pool' plugin. Instead of relying on a central
+     server, it uses Nostr to send/receive PSBTs. (#9261)
+   - Timelock Recovery: A timelock based inheritance scheme.
+     See timelockrecovery.com (#9589)
+ * CLI:
+   - The command line help has been improved; parameters are
+     documented in the same docstring as the command they belong to.
+   - If the --wallet parameter passed to a command is a simple filename,
+     it is now interpreted as relative to the users wallets directory,
+     rather than to the current working directory.
+   - Plugins may add extra commands to the CLI. Plugin commands must
+     be prefixed with the plugin's internal name.
+   - Support for hold invoices.
+   - new commands:
+     - listconfig, helpconfig, unsetconfig
+     - onchain_capital_gains (was previously a field of onchain_history)
+     - {add,settle,cancel,check}_hold_invoice
+     - send_onion_message, get_blinded_path_via
+     - wait_for_sync
+ * Security:
+   - Mitigate against dust attacks; Add option to avoid spending from
+     used addresses. (#9636)
+   - Restrict process memory access on Linux. (#9749)
+ * QML GUI (Android):
+   - "Sweep key" feature ported to mobile
+   - Estimate amount when Max is checked
+   - exposed option to connect to only a single server (--oneserver)
+ * Android:
+   - properly ask for (notification) OS permission access. (#9682)
+   - add option to prevent the app touching the screen brightness (#9321)
+ * Electrum protocol: add padding and some noise to messages (#9875)
+ * Hardware wallets:
+   - Coldcard: add feature to upload multisig wallet configuration to Coldcard via USB.
+   - KeepKey: we now vendor our fork of keepkeylib,
+       instead of using the unmaintained upstream as an external dependency (#9650)
+   - Ledger:
+     - rm support for "HW.1" and "Nano" (non-S) devices (#9652)
+     - rm dependency: btchip-python (#9370)
+ * Builds/binaries:
+   - new minimum OS requirements:
+     - Windows: x86_64, Windows 10 (1809)
+         note: 32-bit Windows is no longer supported.
+     - macOS: 11 "Big Sur"
+     - Linux AppImage: x86_64, glibc 2.31 ("debian 11"-equivalent)
+   - known issue: the Windows binaries are not codesigned atm (but there are GPG sigs!)
+ * Dependencies:
+   - the minimum required python version was increased: 3.8->3.10 (#9418)
+   - new first-party dep: electrum-aionostr
+     - forked the seemingly unmaintained davestgermain/aionostr library
+   - new first-party dep: electrum-ecc
+     - split out our existing libsecp256k1 python bindings into
+       this separate package
+
+
+# Release 4.5.8 (Oct 23, 2024)
+ * Qt Desktop GUI:
+   - fix: regression: bump_fee and dscancel dialogs erroring (#9273)
+
+
+# Release 4.5.7 (Oct 21, 2024)
+ * General:
+   - new: add new historical exchange rate providers: Bitfinex and Bitstamp
+   - fix: wizard regression: 2fa wallet setup erroring (#9253)
+   - fix: python 3.13 compat: could not connect to some self-signed electrum
+     servers with weird TLS certs. As workaround, set pre-3.13 behaviour (#9258)
+ * Lightning:
+   - fix: send update_fee right away after channel_reestablish (3a465593)
+     This fixes a race that can result in a force-closure if we try sending
+     a payment very soon after reestablishing the channel.
+ * Qt Desktop GUI:
+   - fix: show fee warnings also in the transaction dialog (c4fe2796)
+
+
+# Release 4.5.6 (Oct 16, 2024)
+ * General:
+   - new: add support for testnet4 (#9197)
+   - fix: wizard: allow passphrase for some '2fa' seeds (#9088)
+   - fix: trustedcoin wallet wizard continuation if file has keystore-only encryption (#9237)
+   - fix: trustedcoin: sanitize error messages coming from 2fa server
+   - fix: new wizard did not set keystore password if storage was not encrypted (#9147)
+   - changed: set stricter UNIX permissions for log files (fa8595b1)
+ * QML GUI (Android):
+   - new: show seed passphrase in WalletDetails (#9204)
+   - new: set max screen brightness when displaying QR codes (79c08536)
+   - fix: crash due to ConcurrentModificationException (450b9a0)
+   - fix: issue deactivating PIN when no wallet loaded (#8366)
+   - fix: only allow Channel Backup import on Lightning-enabled wallets (8d9bcda)
+ * Qt Desktop GUI:
+   - fix: scanning multi (privkeys, addresses) from QR (4dc64e4)
+ * Hardware wallets:
+   - ColdCard: new: export multisig wallet to coldcard over USB (#7682)
+   - Trezor:
+     - new: add support for new device "Safe 5" (#9171)
+     - update: fix compat with and bump pinned library to 0.13.9 (#9141)
+   - Ledger:
+     - new: add support for new device "Flex" (#9179)
+     - update: bump pinned library to 0.3.0, raise max lib to <0.4 (719292f8)
+   - Jade: update: bump library to 1.0.31 (9a84bb32)
+ * CLI/RPC:
+   - changed: require wallet password for lnpay and similar commands (#9236)
+     (This is in addition to the wallet needing to be loaded,
+     and requiring read access to the config file)
+ * Builds/binaries:
+   - changed: include unit tests in tarballs (#9207)
+   - android:
+     - changed: set target_sdk_version to 34 (2917fde5)
+     - update: bump python version (3.8->3.10) (08127a60)
+     - work towards F-Droid inclusion:
+       - reproducible apks: strip file path prefix from .pyc files (6ebdbf04)
+       - add fastlane metadata for f-droid (#9211)
+       - change versionCode calculation (#9221)
+       - build.gradle: set android.dependenciesInfo.includeInApk=false (af18df10)
+       - contrib/release_www.sh: put android versionCode in "version" file (#9233)
+
+
+# Release 4.5.5 (May 30, 2024)
+ * General:
+   - fix: timeout error shadowed by aiorpcx cancellation bug (#8954)
+   - changed: Fiat exchange rates: do not overwrite the locally saved historical
+     data. Instead, merge old and new data (a2fb70d6). This also ~fixes the
+     CoinGecko historical API by only asking for the last 365 days.
+   - update: support latest revision of SLIP-39 mnemonic spec (to restore) (#9059)
+ * Lightning:
+   - new: unify max fee bounds for payments, make it configurable (#9041)
+   - changed: trampoline fees: instead of hardcoded list, use
+     exponential search, capped by configurable budget (#9033)
+   - fix: opening new channels with peer that has .onion address (#9002)
+ * Dependencies:
+   - remove bitstring (#9020)
+ * QML GUI (Android):
+   - new: add tx options to ConfirmTxDialog, RbfBumpFeeDialog (#8909)
+   - various UI fixes (#9018, 472a65eb)
+ * Qt Desktop GUI:
+   - fix: save notes whenever modified (#8951)
+   - fix: offline 2fa wallet creation failing in some cases (#9037)
+   - various UI fixes (#8962, #8874, #9012, 1047200a, #9058)
+ * Hardware wallets:
+   - Bitbox02: fix: call pairing dialog when necessary (#8971)
+   - Jade: update: bump library to 1.0.29 (#9007)
+ * Binaries:
+   - new: add AppArmor profiles for tarball and AppImage (#9003)
+
+
+# Release 4.5.4 (March 14, 2024)
+ * General:
+    - fix: failing WalletDB upgrade(58) in 4.5.3 (#8913), for wallets with
+      partial txs saved into the history as local txs
+ * Lightning:
+   - changed: use longer final_cltv_delta for client-normal-swap, to
+     give more time for user to come back online while doing the swap (#8940)
+   - changed: create trampoline onions even when directly paying
+     a trampoline forwarder node (777c2ffb)
+ * Hardware wallets:
+   - Trezor:
+     - fix: allow adding SLIP-19 ownership proofs to complete inputs (#8910)
+ * Plugins:
+   - fix: a race in swapserver when handling server-normal-swaps (#8825)
+
+
+# Release 4.5.3 (February 23, 2024)
+ * General:
+   - changed: label tx sizes as "vbytes", and feerates as "sat/vbyte" (#8864)
+   - fix: wizard regression not able to use HWW as cosigner for new wallets (643fbec)
+   - fix: onchain invoice paid detection broken if jsonpatch enabled (#8842)
+   - fix: program not starting because of bad "proxy" config value (#8837)
+   - fix: wizard: don't log sensitive values: replace blacklist with whitelist (638fdf11)
+ * Qt Desktop GUI:
+   - new: basic "add server as bookmark" functionality (#8865)
+   - fix: potential race condition in wizard page construction (c78a90a)
+   - fix: don't use lightning invoice when user specifies MAX amount (#8900)
+   - various UI fixes (#8874, 2882c4b, #8889, 66af6e6)
+ * QML GUI (Android):
+   - fix potential concurrency issue loading wallet (#8355)
+   - fix: wizard: fails to restore from 2fa seed: KeyError: 'x1' (#8861)
+   - various UI fixes (50a53aa, 0a6b2d5, #8782, 6738e1e, c0b8927, 016e500, #8898)
+ * Hardware wallets:
+   - Trezor:
+     - new: support SLIP-19 ownership proofs, for trezor-based Standard_Wallets (#8871)
+     - fix: regression in sign_transaction for trezor one for multisig (#8813)
+ * CLI/RPC:
+   - changed: nicer error messages and error-passing (#8888)
+ * Lightning:
+   - fix: timing issue in lnpeer.reestablish_channel, for replaying unacked updates (79d88dcb)
+
+
+# Release 4.5.2 (January 20, 2024)
+ * Qt Desktop GUI:
+   - fix crash during startup/wizard-open (#8833)
+
+
+# Release 4.5.1 (January 19, 2024)
+ * Lightning:
+   - fix: MPP regression when using gossip that made paying small invoices fail (95c55c542)
+   - fix: better handle dataloss (#8814)
+     - allow manually requesting force-close in WE_ARE_TOXIC state
+     - fix some timing issues
+ * General:
+   - localization: never translate CLI/RPC (0e5a1380)
+   - localization: simplify how default language is chosen (0e5a1380)
+ * QML GUI (Android):
+   - bump min required android version from android 5.0 to 6.0 (#8761)
+     (older versions have not been working in practice since at least 4.4.0)
+   - properly refresh history if addresses are deleted from imported wallets (#8782)
+   - fix crash when LNURLp is scanned/pasted (#8822)
+   - fix crash for new wallets having cosigner using hww #8808)
+   - fix crash in finalizer when txid is undefined (#8807)
+   - various UI fixes (291f0ce, 3d9996a, ec81f00)
+ * Qt Desktop GUI:
+   - also support unfinished wallets when opened through File>Open (#8809)
+   - fix handler for OpenFileEventFilter (6a28ef5)
+
+
+# Release 4.5.0 (January 12, 2024)
  * General:
    - remove SSL options from config (012ce1c)
    - make number of logfiles to keep configurable (5e8b14f)
@@ -7,6 +321,7 @@
    - add warnings and prompt users when signing txs with non-default sighashes (#8687)
    - refactored bip21/bolt11/lnurl/etc-handling into PaymentIdentifiers (#8462)
    - add option to merge duplicate outputs (#8474)
+   - fix: consider bip21 URIs as invalid if they contain unknown req-* param (#8781)
  * Lightning:
    - fix BOLT-04 "MUST set `short_channel_id` to the `short_channel_id` used by the incoming onion" (ca93af2)
    - add support for hold invoices (1acf426)
@@ -21,14 +336,16 @@
    - don't set channel OPEN before channel_ready has been both sent and received (#8641)
    - if trampoline is enabled, do not add non-trampoline nodes to invoices (120faa4)
  * QML GUI (Android):
-   - port to Qt6
+   - port to Qt6 (#8545)
    - fix regression for lnurl-pay (#8585)
    - fix invoice amount bounds check (#8582)
    - fix places where text was rendered off-screen for certain translations (#8611)
    - fix lnworker undefined when node alias requested (#8635)
    - fix BIP39 cosigner script type must be same as primary (8cd95f1)
+   - fix: never use current fiat exchange rate for old historical amounts (#8788)
    - better handle android back-gesture (#8464)
    - new: show private key in address details (016b5eb)
+   - new: show tx inputs in TxDetails and other dialogs (#8772)
    - new: label sync plugin toggle (b6863b4)
    - fix: properly suggest paying BOLT11 invoice onchain if insufficient balance (0a80460)
    - new: message sign & verify (e5e1e46)
@@ -36,6 +353,8 @@
    - new: add coins/UTXOs to addresses list, add filters (cf91d2e)
    - new: delete addresses from imported wallet (#8675)
    - new: add support for lightning address and openalias (03dd38b)
+   - new: add setting to allow screenshots everywhere (0dae1733)
+   - simplify welcome page for first-start network settings (#8737)
    - various UI fixes (b846eab, #8634, 9ed5f7b, 941f425, b20a4b9, af61b9d, 0fb47c8, 2995bc8, ..)
  * Qt Desktop GUI:
    - port wizard to new implementation
@@ -44,6 +363,7 @@
    - new: option to use extra trampoline for legacy payments (b2053c6)
    - new: send change to lightning option for on-chain payments (649ce97)
    - new: notes tab for saving text in the (encrypted) wallet file (d691aa07)
+   - simplify welcome page for first-start network settings (#8737)
    - various UI fixes (#8587, #6526, ..)
  * Hardware wallets:
    - Trezor: allow multiple change outputs (#3920)
@@ -51,6 +371,8 @@
    - Bitbox02: update to 6.2.0 (#8459)
  * Plugins:
    - new: swapserver plugin (#8489)
+ * Builds/binaries:
+   - update bundled zbar, for security fixes (#8805)
 
 
 # Release 4.4.6 (August 18, 2023) (security update)
@@ -195,7 +517,7 @@
     - Coins tab: New menu that lets users easily spend a selection
       of UTXOs into a new channel, or into a submarine swap (Qt GUI).
  * Internal:
-    - Lightning invoices are regenerated everytime routing hints are
+    - Lightning invoices are regenerated every time routing hints are
       deprecated due to liquidity changes.
     - Script descriptors are used internally to sign transactions.
 
@@ -595,7 +917,7 @@ below are user-visible.
  * Android PIN reset: If the password is unified, the PIN can be reset
    by providing the password.
  * Android: on-chain fees have been removed from the settings
-   dialog. Instead, the fee slider is shown to the user everytime an
+   dialog. Instead, the fee slider is shown to the user every time an
    on-chain transaction will be performed (sending a payment, opening
    a channel, initiating a submarine swap)
  * BIP-0350: use bech32m for witness version 1+ addresses (4315fa43).

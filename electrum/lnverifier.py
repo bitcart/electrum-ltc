@@ -28,9 +28,10 @@ import threading
 from typing import TYPE_CHECKING, Dict, Set
 
 import aiorpcx
+import electrum_ecc as ecc
+from electrum_ecc import ECPubkey
 
 from . import bitcoin
-from . import ecc
 from . import constants
 from .util import bfh, NetworkJobOnDefaultServer
 from .lnutil import funding_output_script_from_keys, ShortChannelID
@@ -101,7 +102,7 @@ class LNChannelVerifier(NetworkJobOnDefaultServer):
             header = blockchain.read_header(block_height)
             if header is None:
                 if block_height < constants.net.max_checkpoint():
-                    await self.taskgroup.spawn(self.network.request_chunk(block_height, None, can_return_early=True))
+                    await self.taskgroup.spawn(self.network.request_chunk(block_height, can_return_early=True))
                 continue
             self.started_verifying_channel.add(short_channel_id)
             await self.taskgroup.spawn(self.verify_channel(block_height, short_channel_id))
@@ -183,6 +184,6 @@ def verify_sig_for_channel_update(chan_upd: dict, node_id: bytes) -> bool:
     pre_hash = msg_bytes[2+64:]
     h = sha256d(pre_hash)
     sig = chan_upd['signature']
-    if not ecc.verify_signature(node_id, sig, h):
+    if not ECPubkey(node_id).ecdsa_verify(sig, h):
         return False
     return True

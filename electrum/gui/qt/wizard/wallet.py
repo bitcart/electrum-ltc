@@ -3,11 +3,11 @@ import os
 import sys
 import threading
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, List, Tuple
 
-from PyQt5.QtCore import Qt, QTimer, QRect, pyqtSignal
-from PyQt5.QtGui import QPen, QPainter, QPalette
-from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QWidget,
+from PyQt6.QtCore import Qt, QTimer, QRect, pyqtSignal
+from PyQt6.QtGui import QPen, QPainter, QPalette, QPixmap
+from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QWidget,
                              QFileDialog, QSlider, QGridLayout, QDialog, QApplication)
 
 from electrum.bip32 import is_bip32_derivation, BIP32Node, normalize_bip32_derivation, xpub_type
@@ -17,25 +17,24 @@ from electrum.keystore import bip44_derivation, bip39_to_seed, purpose48_derivat
 from electrum.plugin import run_hook, HardwarePluginLibraryUnavailable
 from electrum.storage import StorageReadWriteError
 from electrum.util import WalletFileException, get_new_wallet_name, UserFacingException, InvalidPassword
-from electrum.util import is_subpath
+from electrum.util import is_subpath, ChoiceItem, multisig_type
 from electrum.wallet import wallet_types
 from .wizard import QEAbstractWizard, WizardComponent
 from electrum.logging import get_logger, Logger
 from electrum import WalletStorage, mnemonic, keystore
 from electrum.wallet_db import WalletDB
-from electrum.wizard import NewWalletWizard
+from electrum.wizard import NewWalletWizard, KeystoreWizard
 
 from electrum.gui.qt.bip39_recovery_dialog import Bip39RecoveryDialog
 from electrum.gui.qt.password_dialog import PasswordLayout, PW_NEW, MSG_ENTER_PASSWORD, PasswordLayoutForHW
-from electrum.gui.qt.seed_dialog import SeedLayout, MSG_PASSPHRASE_WARN_ISSUE4566, KeysLayout
+from electrum.gui.qt.seed_dialog import SeedWidget, MSG_PASSPHRASE_WARN_ISSUE4566, KeysWidget
 from electrum.gui.qt.util import (PasswordLineEdit, char_width_in_lineedit, WWLabel, InfoButton, font_height,
-                                  ChoiceWidget, MessageBoxMixin, WindowModalDialog, ChoicesLayout, CancelButton,
-                                  Buttons, OkButton)
+                                  ChoiceWidget, MessageBoxMixin, icon_path, IconLabel, read_QIcon)
+from electrum.gui.qt.plugins_dialog import PluginsDialog
 
 if TYPE_CHECKING:
     from electrum.simple_config import SimpleConfig
-    from electrum.plugin import Plugins
-    from electrum.daemon import Daemon
+    from electrum.plugin import Plugins, DeviceInfo
     from electrum.gui.qt import QElectrumApplication
 
 WIF_HELP_TEXT = (_('WIF keys are typed in Electrum, based on script type.') + '\n\n' +
@@ -46,8 +45,36 @@ WIF_HELP_TEXT = (_('WIF keys are typed in Electrum, based on script type.') + '\
 
 MSG_HW_STORAGE_ENCRYPTION = _("Set wallet file encryption.") + '\n'\
                           + _("Your wallet file does not contain secrets, mostly just metadata. ") \
-                          + _("It also contains your master public key that allows watching your addresses.") + '\n\n'\
-                          + _("Note: If you enable this setting, you will need your hardware device to open your wallet.")
+                          + _("It also contains your master public key that allows watching your addresses.")
+
+
+
+class QEKeystoreWizard(KeystoreWizard, QEAbstractWizard, MessageBoxMixin):
+    _logger = get_logger(__name__)
+
+    def __init__(self, config: 'SimpleConfig', wallet_type: str, app: 'QElectrumApplication', plugins: 'Plugins', *, start_viewstate=None):
+        QEAbstractWizard.__init__(self, config, app, start_viewstate=start_viewstate)
+        KeystoreWizard.__init__(self, plugins)
+        self._wallet_type = wallet_type
+        self.window_title = _('Extend wallet keystore')
+        # attach gui classes to views
+        self.navmap_merge({
+            'keystore_type': {'gui': WCExtendKeystore},
+            'enter_seed': {'gui': WCHaveSeed},
+            'enter_ext': {'gui': WCEnterExt},
+            'choose_hardware_device': {'gui': WCChooseHWDevice},
+            'script_and_derivation': {'gui': WCScriptAndDerivation},
+            'wallet_password': {'gui': WCWalletPassword},
+            'wallet_password_hardware': {'gui': WCWalletPasswordHardware},
+        })
+
+    def is_single_password(self):
+        return True
+
+    def run(self):
+        if self.exec() == QDialog.DialogCode.Rejected:
+            return
+        return self._result
 
 
 class QENewWalletWizard(NewWalletWizard, QEAbstractWizard, MessageBoxMixin):
@@ -115,6 +142,7 @@ class QENewWalletWizard(NewWalletWizard, QEAbstractWizard, MessageBoxMixin):
             },
             'have_seed': {
                 'next': lambda d: 'have_ext' if self.wants_ext(d) else self.on_have_or_confirm_seed(d),
+                'accept': lambda d: None if self.wants_ext(d) else self.maybe_master_pubkey(d),
                 'last': lambda d: self.is_single_password() and not
                                   (self.needs_derivation_path(d) or self.is_multisig(d) or self.wants_ext(d))
             },
@@ -182,6 +210,7 @@ class QENewWalletWizard(NewWalletWizard, QEAbstractWizard, MessageBoxMixin):
         wallet_file = wizard_data['wallet_name']
 
         storage = WalletStorage(wallet_file)
+        assert storage.file_exists(), f"file {wallet_file!r} does not exist"
         if not storage.is_encrypted_with_user_pw() and not storage.is_encrypted_with_hw_device():
             return True
 
@@ -202,7 +231,7 @@ class QENewWalletWizard(NewWalletWizard, QEAbstractWizard, MessageBoxMixin):
         vbox = QVBoxLayout()
         vbox.addSpacing(100)
         label.setMinimumWidth(300)
-        label.setAlignment(Qt.AlignCenter)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         vbox.addWidget(label)
         vbox.addSpacing(100)
         dialog.setLayout(vbox)
@@ -236,22 +265,6 @@ class QENewWalletWizard(NewWalletWizard, QEAbstractWizard, MessageBoxMixin):
         if on_finished:
             on_finished()
 
-    def query_choice(self, msg, choices, title=None, default_choice=None):
-        # Needed by QtHandler for hardware wallets
-        if title is None:
-            title = _('Question')
-        dialog = WindowModalDialog(self.top_level_window(), title=title)
-        dialog.setMinimumWidth(400)
-        clayout = ChoicesLayout(msg, choices, checked_index=default_choice)
-        vbox = QVBoxLayout(dialog)
-        vbox.addLayout(clayout.layout())
-        cancel_button = CancelButton(dialog)
-        vbox.addLayout(Buttons(cancel_button, OkButton(dialog)))
-        cancel_button.setFocus()
-        if not dialog.exec_():
-            return None
-        return clayout.selected_index()
-
 
 class WalletWizardComponent(WizardComponent, ABC):
     # ^ this class only exists to help with typing
@@ -280,9 +293,14 @@ class WCWalletName(WalletWizardComponent, Logger):
         self.name_e = QLineEdit()
         hbox.addWidget(self.name_e)
         button = QPushButton(_('Choose...'))
+        button_create_new = QPushButton(_('New'))
         hbox.addWidget(button)
+        hbox.addWidget(button_create_new)
         self.layout().addLayout(hbox)
+        outside_label = WWLabel('')
+        self.layout().addWidget(outside_label)
 
+        self.layout().addSpacing(50)
         msg_label = WWLabel('')
         self.layout().addWidget(msg_label)
         hbox2 = QHBoxLayout()
@@ -293,17 +311,6 @@ class WCWalletName(WalletWizardComponent, Logger):
         hbox2.addWidget(self.pw_e)
         hbox2.addStretch()
         self.layout().addLayout(hbox2)
-
-        self.layout().addSpacing(50)
-        vbox_create_new = QVBoxLayout()
-        vbox_create_new.addWidget(QLabel(_('Alternatively') + ':'), alignment=Qt.AlignLeft)
-        button_create_new = QPushButton(_('Create New Wallet'))
-        button_create_new.setMinimumWidth(120)
-        vbox_create_new.addWidget(button_create_new, alignment=Qt.AlignLeft)
-        widget_create_new = QWidget()
-        widget_create_new.setLayout(vbox_create_new)
-        vbox_create_new.setContentsMargins(0, 0, 0, 0)
-        self.layout().addWidget(widget_create_new)
         self.layout().addStretch(1)
 
         temp_storage = None  # type: Optional[WalletStorage]
@@ -358,8 +365,7 @@ class WCWalletName(WalletWizardComponent, Logger):
                           + _("Press 'Next' to create this wallet, or choose another file.")
                 elif not wallet_from_memory:
                     if temp_storage.is_encrypted_with_user_pw():
-                        msg = _("This file is encrypted with a password.") + '\n' \
-                              + _('Enter your password or choose another file.')
+                        msg = _("This file is encrypted with a password.")
                         user_needs_to_enter_password = True
                     elif temp_storage.is_encrypted_with_hw_device():
                         msg = _("This file is encrypted using a hardware device.") + '\n' \
@@ -373,14 +379,16 @@ class WCWalletName(WalletWizardComponent, Logger):
             if msg is None:
                 msg = _('Cannot read file')
             if filename and os.path.isabs(relative_path(_path)):
-                msg += '\n\n' + _('Note: this wallet file is outside the default wallets folder.')
+                outside_text = _('Note: this wallet file is outside the default wallets folder.')
+            else:
+                outside_text = ''
+            outside_label.setText(outside_text)
             msg_label.setText(msg)
-            widget_create_new.setVisible(bool(temp_storage and temp_storage.file_exists()))
             if user_needs_to_enter_password:
                 pw_label.show()
                 self.pw_e.show()
                 if not self.name_e.hasFocus():
-                    self.pw_e.setFocus(True)
+                    self.pw_e.setFocus()
             else:
                 pw_label.hide()
                 self.pw_e.hide()
@@ -392,12 +400,16 @@ class WCWalletName(WalletWizardComponent, Logger):
         self.name_e.textChanged.connect(on_filename)
         self.name_e.setText(relative_path(path))
 
+    def initialFocus(self) -> Optional[QWidget]:
+        return self.pw_e
+
     def apply(self):
         if self.wallet_exists:
             # use full path
             wallet_folder = self.wizard.config.get_datadir_wallet_path()
             self.wizard_data['wallet_name'] = os.path.join(wallet_folder, self.name_e.text())
         else:
+            # FIXME: wizard_data['wallet_name'] is sometimes a full path, sometimes a basename
             self.wizard_data['wallet_name'] = self.name_e.text()
         self.wizard_data['wallet_exists'] = self.wallet_exists
         self.wizard_data['wallet_is_open'] = self.wallet_is_open
@@ -410,40 +422,66 @@ class WCWalletType(WalletWizardComponent):
         WalletWizardComponent.__init__(self, parent, wizard, title=_('Create new wallet'))
         message = _('What kind of wallet do you want to create?')
         wallet_kinds = [
-            ('standard',  _('Standard wallet')),
-            ('2fa',       _('Wallet with two-factor authentication')),
-            ('multisig',  _('Multi-signature wallet')),
-            ('imported',  _('Import Bitcoin addresses or private keys')),
+            ChoiceItem(key='standard', label=_('Standard wallet')),
+            ChoiceItem(key='2fa', label=_('Wallet with two-factor authentication')),
+            ChoiceItem(key='multisig', label=_('Multi-signature wallet')),
+            ChoiceItem(key='imported', label=_('Import Bitcoin addresses or private keys')),
         ]
-        choices = [pair for pair in wallet_kinds if pair[0] in wallet_types]
+        choices = [c for c in wallet_kinds if c.key in wallet_types]
 
-        self.choice_w = ChoiceWidget(message=message, choices=choices, selected='standard')
+        self.choice_w = ChoiceWidget(message=message, choices=choices, default_key='standard')
         self.layout().addWidget(self.choice_w)
         self.layout().addStretch(1)
         self._valid = True
 
     def apply(self):
-        self.wizard_data['wallet_type'] = self.choice_w.selected_item[0]
+        self.wizard_data['wallet_type'] = self.choice_w.selected_key
 
 
 class WCKeystoreType(WalletWizardComponent):
+
     def __init__(self, parent, wizard):
         WalletWizardComponent.__init__(self, parent, wizard, title=_('Keystore'))
         message = _('Do you want to create a new seed, or to restore a wallet using an existing seed?')
         choices = [
-            ('createseed', _('Create a new seed')),
-            ('haveseed',   _('I already have a seed')),
-            ('masterkey',  _('Use a master key')),
-            ('hardware',   _('Use a hardware device'))
+            ChoiceItem(key='createseed', label=_('Create a new seed')),
+            ChoiceItem(key='haveseed', label=_('I already have a seed')),
+            ChoiceItem(key='masterkey', label=_('Use a master key')),
+            ChoiceItem(key='hardware', label=_('Use a hardware device')),
         ]
-
         self.choice_w = ChoiceWidget(message=message, choices=choices)
         self.layout().addWidget(self.choice_w)
         self.layout().addStretch(1)
         self._valid = True
 
     def apply(self):
-        self.wizard_data['keystore_type'] = self.choice_w.selected_item[0]
+        self.wizard_data['keystore_type'] = self.choice_w.selected_key
+
+
+
+class WCExtendKeystore(WalletWizardComponent):
+
+    def __init__(self, parent, wizard):
+        WalletWizardComponent.__init__(self, parent, wizard, title=_('Keystore'))
+        message = _('What type of signing method do you want to add?')
+        choices = [
+            ChoiceItem(key='haveseed', label=_('Enter seed')),
+            ChoiceItem(key='hardware', label=_('Use a hardware device')),
+        ]
+        self.choice_w = ChoiceWidget(message=message, choices=choices)
+        self.layout().addWidget(self.choice_w)
+        self.layout().addStretch(1)
+        self._valid = True
+        self.wizard_data['wallet_type'] = self._wallet_type = wizard._wallet_type
+
+    def apply(self):
+        self.wizard_data['wallet_type'] = self._wallet_type
+        self.wizard_data['keystore_type'] = self.choice_w.selected_key
+        if multisig_type(self._wallet_type):
+            self.wizard_data['wallet_type'] = self._wallet_type = 'multisig'
+            self.wizard_data['multisig_participants'] = 2
+            self.wizard_data['multisig_signatures'] = 2
+            self.wizard_data['multisig_cosigner_data'] = {}
 
 
 class WCCreateSeed(WalletWizardComponent):
@@ -451,7 +489,7 @@ class WCCreateSeed(WalletWizardComponent):
         WalletWizardComponent.__init__(self, parent, wizard, title=_('Wallet Seed'))
         self._busy = True
         self.seed_type = 'standard' if self.wizard.config.WIZARD_DONT_CREATE_SEGWIT else 'segwit'
-        self.slayout = None
+        self.seed_widget = None
         self.seed = None
 
     def on_ready(self):
@@ -460,26 +498,25 @@ class WCCreateSeed(WalletWizardComponent):
         QTimer.singleShot(1, self.create_seed)
 
     def apply(self):
-        if self.slayout:
+        if self.seed_widget:
             self.wizard_data['seed'] = self.seed
             self.wizard_data['seed_type'] = self.seed_type
-            self.wizard_data['seed_extend'] = self.slayout.is_ext
+            self.wizard_data['seed_extend'] = self.seed_widget.is_ext
             self.wizard_data['seed_variant'] = 'electrum'
-            self.wizard_data['seed_extra_words'] = ''  # empty default
 
     def create_seed(self):
         self.busy = True
         self.seed = mnemonic.Mnemonic('en').make_seed(seed_type=self.seed_type)
 
-        self.slayout = SeedLayout(
+        self.seed_widget = SeedWidget(
             title=_('Your wallet generation seed is:'),
             seed=self.seed,
-            options=['ext'],
+            options=['ext', 'electrum'],
             msg=True,
             parent=self,
             config=self.wizard.config,
         )
-        self.layout().addLayout(self.slayout)
+        self.layout().addWidget(self.seed_widget)
         self.layout().addStretch(1)
         self.busy = False
         self.valid = True
@@ -496,19 +533,16 @@ class WCConfirmSeed(WalletWizardComponent):
 
         self.layout().addWidget(WWLabel(message))
 
-        # TODO: SeedLayout assumes too much in parent, refactor SeedLayout
-        # for now, fake parent.next_button.setEnabled
-        class Hack:
-            def setEnabled(self2, b):
-                self.valid = b
-        self.next_button = Hack()
-
-        self.slayout = SeedLayout(
+        self.seed_widget = SeedWidget(
             is_seed=lambda x: x == self.wizard_data['seed'],
-            parent=self,
             config=self.wizard.config,
         )
-        self.layout().addLayout(self.slayout)
+
+        def seed_valid_changed(valid):
+            self.valid = valid
+
+        self.seed_widget.validChanged.connect(seed_valid_changed)
+        self.layout().addWidget(self.seed_widget)
 
         wizard.app.clipboard().clear()
 
@@ -534,6 +568,12 @@ class WCEnterExt(WalletWizardComponent, Logger):
         self.ext_edit.textEdited.connect(self.on_text_edited)
         self.layout().addWidget(self.ext_edit)
         self.layout().addStretch(1)
+        self.warn_label = IconLabel(reverse=True, hide_if_empty=True)
+        self.warn_label.setIcon(read_QIcon('warning.png'))
+        self.layout().addWidget(self.warn_label)
+
+    def on_ready(self):
+        self.validate()
 
     def on_text_edited(self, text):
         # TODO also for cosigners?
@@ -543,30 +583,10 @@ class WCEnterExt(WalletWizardComponent, Logger):
 
     def validate(self):
         self.apply()
-        text = self.ext_edit.text()
-        if len(text) == 0:
-            self.valid = False
-            return
 
-        cosigner_data = self.wizard.current_cosigner(self.wizard_data)
-
-        if self.wizard_data['wallet_type'] == 'multisig':
-            if 'seed_variant' in cosigner_data and cosigner_data['seed_variant'] in ['bip39', 'slip39']:
-                # defer validation to when derivation path is known
-                self.valid = True
-            else:
-                if self.wizard.has_duplicate_masterkeys(self.wizard_data):
-                    self.logger.debug('Duplicate master keys!')
-                    # TODO: user feedback
-                    self.valid = False
-                elif self.wizard.has_heterogeneous_masterkeys(self.wizard_data):
-                    self.logger.debug('Heterogenous master keys!')
-                    # TODO: user feedback
-                    self.valid = False
-                else:
-                    self.valid = True
-        else:
-            self.valid = True
+        musig_valid, errortext = self.wizard.check_multisig_constraints(self.wizard_data)
+        self.valid = musig_valid
+        self.warn_label.setText(errortext)
 
     def apply(self):
         cosigner_data = self.wizard.current_cosigner(self.wizard_data)
@@ -585,8 +605,14 @@ class WCConfirmExt(WalletWizardComponent):
         self.layout().addWidget(self.ext_edit)
         self.layout().addStretch(1)
 
-    def on_text_edited(self, text):
-        self.valid = text == self.wizard_data['seed_extra_words']
+    def on_ready(self):
+        self.validate()
+
+    def on_text_edited(self, *args):
+        self.validate()
+
+    def validate(self):
+        self.valid = self.ext_edit.text() == self.wizard_data['seed_extra_words']
 
     def apply(self):
         pass
@@ -597,36 +623,44 @@ class WCHaveSeed(WalletWizardComponent, Logger):
         WalletWizardComponent.__init__(self, parent, wizard, title=_('Enter Seed'))
         Logger.__init__(self)
 
-        self.slayout = None
-
         self.layout().addWidget(WWLabel(_('Please enter your seed phrase in order to restore your wallet.')))
+        self.warn_label = IconLabel(reverse=True, hide_if_empty=True)
+        self.warn_label.setIcon(read_QIcon('warning.png'))
 
-        # TODO: SeedLayout assumes too much in parent, refactor SeedLayout
-        # for now, fake parent.next_button.setEnabled
-        class Hack:
-            def setEnabled(self2, b):
-                if not b:
-                    self.valid = b
-                else:
-                    self.validate()
-
-        self.next_button = Hack()
+        self.seed_widget = None
+        self.can_passphrase = True
 
     def on_ready(self):
-        options = ['ext'] if self.wizard_data['wallet_type'] == '2fa' else ['ext', 'bip39', 'slip39']
-        self.slayout = SeedLayout(
+        options = ['ext', 'electrum', 'bip39', 'slip39']
+        if self.wizard_data['wallet_type'] == '2fa':
+            options = ['ext', 'electrum']
+        else:
+            if self.params and 'seed_options' in self.params:
+                options = self.params['seed_options']
+
+        self.seed_widget = SeedWidget(
             is_seed=self.is_seed,
             options=options,
-            parent=self,
             config=self.wizard.config,
         )
-        self.slayout.updated.connect(self.validate)
 
-        self.layout().addLayout(self.slayout)
+        def seed_valid_changed(valid):
+            if not valid:
+                self.valid = valid
+            else:
+                self.validate()
+
+        self.seed_widget.validChanged.connect(seed_valid_changed)
+        self.seed_widget.updated.connect(self.validate)
+
+        self.layout().addWidget(self.seed_widget)
         self.layout().addStretch(1)
 
+        self.layout().addWidget(self.warn_label)
+
     def is_seed(self, x):
-        t = mnemonic.seed_type(x)
+        # really only used for electrum seeds. bip39 and slip39 are validated in SeedWidget
+        t = mnemonic.calc_seed_type(x)
         if self.wizard_data['wallet_type'] == 'standard':
             return mnemonic.is_seed(x) and not mnemonic.is_any_2fa_seed_type(t)
         elif self.wizard_data['wallet_type'] == '2fa':
@@ -636,11 +670,11 @@ class WCHaveSeed(WalletWizardComponent, Logger):
             return t in ['standard', 'segwit']
 
     def validate(self):
-        # precond: only call when SeedLayout deems seed a valid seed
-        seed = self.slayout.get_seed()
-        seed_variant = self.slayout.seed_type
+        # precond: only call when SeedWidget deems seed a valid seed
+        seed = self.seed_widget.get_seed()
+        seed_variant = self.seed_widget.seed_type
         wallet_type = self.wizard_data['wallet_type']
-        seed_valid, seed_type, validation_message = self.wizard.validate_seed(seed, seed_variant, wallet_type)  #
+        seed_valid, seed_type, validation_message, self.can_passphrase = self.wizard.validate_seed(seed, seed_variant, wallet_type)
 
         is_cosigner = self.wizard_data['wallet_type'] == 'multisig' and 'multisig_current_cosigner' in self.wizard_data
 
@@ -649,23 +683,23 @@ class WCHaveSeed(WalletWizardComponent, Logger):
             return
 
         self.apply()
-        if not self.wizard.check_multisig_constraints(self.wizard_data)[0]:
-            # TODO: user feedback
+        musig_valid, errortext = self.wizard.check_multisig_constraints(self.wizard_data)
+        if not musig_valid:
             seed_valid = False
 
+        self.warn_label.setText(errortext)
         self.valid = seed_valid
 
     def apply(self):
         cosigner_data = self.wizard.current_cosigner(self.wizard_data)
 
-        cosigner_data['seed'] = self.slayout.get_seed()
-        cosigner_data['seed_variant'] = self.slayout.seed_type
-        if self.slayout.seed_type == 'electrum':
-            cosigner_data['seed_type'] = mnemonic.seed_type(self.slayout.get_seed())
+        cosigner_data['seed'] = self.seed_widget.get_seed()
+        cosigner_data['seed_variant'] = self.seed_widget.seed_type
+        if self.seed_widget.seed_type == 'electrum':
+            cosigner_data['seed_type'] = mnemonic.calc_seed_type(self.seed_widget.get_seed())
         else:
-            cosigner_data['seed_type'] = self.slayout.seed_type
-        cosigner_data['seed_extend'] = self.slayout.is_ext
-        cosigner_data['seed_extra_words'] = ''  # empty default
+            cosigner_data['seed_type'] = self.seed_widget.seed_type
+        cosigner_data['seed_extend'] = self.seed_widget.is_ext if self.can_passphrase else False
 
 
 class WCScriptAndDerivation(WalletWizardComponent, Logger):
@@ -673,8 +707,11 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
         WalletWizardComponent.__init__(self, parent, wizard, title=_('Script type and Derivation path'))
         Logger.__init__(self)
 
-        self.choice_w = None
+        self.choice_w = None  # type: ChoiceWidget
         self.derivation_path_edit = None
+
+        self.warn_label = IconLabel(reverse=True, hide_if_empty=True)
+        self.warn_label.setIcon(read_QIcon('warning.png'))
 
     def on_ready(self):
         message1 = _('Choose the type of addresses in your wallet.')
@@ -687,9 +724,12 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
         if self.wizard_data['wallet_type'] == 'multisig':
             choices = [
                 # TODO: nicer to refactor 'standard' to 'p2sh', but backend wallet still uses 'standard'
-                ('standard', 'legacy multisig (p2sh)', normalize_bip32_derivation("m/45'/0")),
-                ('p2wsh-p2sh', 'p2sh-segwit multisig (p2wsh-p2sh)', purpose48_derivation(0, xtype='p2wsh-p2sh')),
-                ('p2wsh', 'native segwit multisig (p2wsh)', purpose48_derivation(0, xtype='p2wsh')),
+                ChoiceItem(key='standard', label='legacy multisig (p2sh)',
+                           extra_data=normalize_bip32_derivation("m/45'/0")),
+                ChoiceItem(key='p2wsh-p2sh', label='p2sh-segwit multisig (p2wsh-p2sh)',
+                           extra_data=purpose48_derivation(0, xtype='p2wsh-p2sh')),
+                ChoiceItem(key='p2wsh', label='native segwit multisig (p2wsh)',
+                           extra_data=purpose48_derivation(0, xtype='p2wsh')),
             ]
             if 'multisig_current_cosigner' in self.wizard_data:
                 # get script type of first cosigner
@@ -702,9 +742,12 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
             default_choice = 'p2wpkh'
             choices = [
                 # TODO: nicer to refactor 'standard' to 'p2pkh', but backend wallet still uses 'standard'
-                ('standard', 'legacy (p2pkh)', bip44_derivation(0, bip43_purpose=44)),
-                ('p2wpkh-p2sh', 'p2sh-segwit (p2wpkh-p2sh)', bip44_derivation(0, bip43_purpose=49)),
-                ('p2wpkh', 'native segwit (p2wpkh)', bip44_derivation(0, bip43_purpose=84)),
+                ChoiceItem(key='standard', label='legacy (p2pkh)',
+                           extra_data=bip44_derivation(0, bip43_purpose=44)),
+                ChoiceItem(key='p2wpkh-p2sh', label='p2sh-segwit (p2wpkh-p2sh)',
+                           extra_data=bip44_derivation(0, bip43_purpose=49)),
+                ChoiceItem(key='p2wpkh', label='native segwit (p2wpkh)',
+                           extra_data=bip44_derivation(0, bip43_purpose=84)),
             ]
 
         if self.wizard_data['wallet_type'] == 'standard' and not self.wizard_data['keystore_type'] == 'hardware':
@@ -712,7 +755,7 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
 
             passphrase = self.wizard_data['seed_extra_words'] if self.wizard_data['seed_extend'] else ''
             if self.wizard_data['seed_variant'] == 'bip39':
-                root_seed = bip39_to_seed(self.wizard_data['seed'], passphrase)
+                root_seed = bip39_to_seed(self.wizard_data['seed'], passphrase=passphrase)
             elif self.wizard_data['seed_variant'] == 'slip39':
                 root_seed = self.wizard_data['seed'].decrypt(passphrase)
 
@@ -730,12 +773,12 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
                 self.derivation_path_edit.setText(account["derivation_path"])
 
             button.clicked.connect(lambda: Bip39RecoveryDialog(self, get_account_xpub, on_account_select))
-            self.layout().addWidget(button, alignment=Qt.AlignLeft)
+            self.layout().addWidget(button, alignment=Qt.AlignmentFlag.AlignLeft)
             self.layout().addWidget(QLabel(_("Or")))
 
         def on_choice_click(index):
-            self.derivation_path_edit.setText(self.choice_w.selected_item[2])
-        self.choice_w = ChoiceWidget(message=message1, choices=choices, selected=default_choice)
+            self.derivation_path_edit.setText(self.choice_w.selected_item.extra_data)
+        self.choice_w = ChoiceWidget(message=message1, choices=choices, default_key=default_choice)
         self.choice_w.itemSelected.connect(on_choice_click)
 
         if not hide_choices:
@@ -750,6 +793,7 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
         on_choice_click(self.choice_w.selected_index)  # set default value for derivation path
 
         self.layout().addStretch(1)
+        self.layout().addWidget(self.warn_label)
 
     def validate(self):
         self.apply()
@@ -758,16 +802,18 @@ class WCScriptAndDerivation(WalletWizardComponent, Logger):
         valid = is_bip32_derivation(cosigner_data['derivation_path'])
 
         if valid:
-            valid, error = self.wizard.check_multisig_constraints(self.wizard_data)
+            valid, errortext = self.wizard.check_multisig_constraints(self.wizard_data)
             if not valid:
-                # TODO: user feedback
-                self.logger.error(error)
+                self.logger.error(errortext)
+            self.warn_label.setText(errortext)
+        else:
+            self.warn_label.setText(_('Invalid derivation path'))
 
         self.valid = valid
 
     def apply(self):
         cosigner_data = self.wizard.current_cosigner(self.wizard_data)
-        cosigner_data['script_type'] = self.choice_w.selected_item[0]
+        cosigner_data['script_type'] = self.choice_w.selected_key
         cosigner_data['derivation_path'] = str(self.derivation_path_edit.text())
 
 
@@ -777,9 +823,9 @@ class WCCosignerKeystore(WalletWizardComponent):
 
         message = _('Add a cosigner to your multi-sig wallet')
         choices = [
-            ('masterkey', _('Enter cosigner key')),
-            ('haveseed', _('Enter cosigner seed')),
-            ('hardware', _('Cosign with hardware device'))
+            ChoiceItem(key='masterkey', label=_('Enter cosigner key')),
+            ChoiceItem(key='haveseed', label=_('Enter cosigner seed')),
+            ChoiceItem(key='hardware', label=_('Cosign with hardware device')),
         ]
 
         self.choice_w = ChoiceWidget(message=message, choices=choices)
@@ -802,20 +848,20 @@ class WCCosignerKeystore(WalletWizardComponent):
         # different from old wizard: master public key for sharing is now shown on this page
         self.layout().addSpacing(20)
         self.layout().addWidget(WWLabel(_('Below is your master public key. Please share it with your cosigners')))
-        slayout = SeedLayout(
+        seed_widget = SeedWidget(
             self.wizard_data['multisig_master_pubkey'],
             icon=False,
             for_seed_words=False,
             config=self.wizard.config,
         )
-        self.layout().addLayout(slayout)
+        self.layout().addWidget(seed_widget)
         self.layout().addStretch(1)
 
     def apply(self):
-        self.wizard_data['cosigner_keystore_type'] = self.choice_w.selected_item[0]
+        self.wizard_data['cosigner_keystore_type'] = self.choice_w.selected_key
         self.wizard_data['multisig_current_cosigner'] = self.cosigner
         self.wizard_data['multisig_cosigner_data'][str(self.cosigner)] = {
-            'keystore_type': self.choice_w.selected_item[0]
+            'keystore_type': self.choice_w.selected_key
         }
 
 
@@ -823,11 +869,15 @@ class WCHaveMasterKey(WalletWizardComponent):
     def __init__(self, parent, wizard):
         WalletWizardComponent.__init__(self, parent, wizard, title=_('Create keystore from a master key'))
 
-        self.slayout = None
+        self.keys_widget = None
 
         self.message_create = ' '.join([
             _("To create a watching-only wallet, please enter your master public key (xpub/ypub/zpub)."),
             _("To create a spending wallet, please enter a master private key (xprv/yprv/zprv).")
+        ])
+        self.message_multisig = ' '.join([
+            _('Please enter your master private key (xprv).'),
+            _('You can also enter a public key (xpub) here, but be aware you will then create a watch-only wallet if all cosigners are added using public keys'),
         ])
         self.message_cosign = ' '.join([
             _('Please enter the master public key (xpub) of your cosigner.'),
@@ -839,45 +889,53 @@ class WCHaveMasterKey(WalletWizardComponent):
         self.label.setMinimumWidth(400)
         self.header_layout.addWidget(self.label)
 
-        # TODO: KeysLayout assumes too much in parent, refactor KeysLayout
-        # for now, fake parent.next_button.setEnabled
-        class Hack:
-            def setEnabled(self2, b):
-                self.valid = b
-
-            def setToolTip(self2, b):
-                pass
-        self.next_button = Hack()
+        self.warn_label = IconLabel(reverse=True, hide_if_empty=True)
+        self.warn_label.setIcon(read_QIcon('warning.png'))
 
     def on_ready(self):
         if self.wizard_data['wallet_type'] == 'standard':
             self.label.setText(self.message_create)
 
             def is_valid(x) -> bool:
-                return bool(keystore.from_master_key(x))
+                self.apply()
+                key_valid, message = self.wizard.validate_master_key(x, self.wizard_data['wallet_type'])
+                self.warn_label.setText(message)
+                return key_valid
         elif self.wizard_data['wallet_type'] == 'multisig':
             if 'multisig_current_cosigner' in self.wizard_data:
                 self.title = _("Add Cosigner {}").format(self.wizard_data['multisig_current_cosigner'])
                 self.label.setText(self.message_cosign)
             else:
-                self.label.setText(self.message_create)
+                self.label.setText(self.message_multisig)
 
             def is_valid(x) -> bool:
-                if not keystore.is_bip32_key(x):
-                    return False
                 self.apply()
-                if not self.wizard.check_multisig_constraints(self.wizard_data)[0]:
-                    # TODO: user feedback
+                key_valid, message = self.wizard.validate_master_key(x, self.wizard_data['wallet_type'])
+                if not key_valid:
+                    self.warn_label.setText(message)
+                    return False
+                musig_valid, errortext = self.wizard.check_multisig_constraints(self.wizard_data)
+                self.warn_label.setText(errortext)
+                if not musig_valid:
                     return False
                 return True
         else:
             raise Exception(f"unexpected wallet type: {self.wizard_data['wallet_type']}")
-        self.slayout = KeysLayout(parent=self, header_layout=self.header_layout, is_valid=is_valid,
-                                  allow_multi=False, config=self.wizard.config)
-        self.layout().addLayout(self.slayout)
+
+        self.keys_widget = KeysWidget(parent=self, header_layout=self.header_layout, is_valid=is_valid,
+                                      allow_multi=False, config=self.wizard.config)
+
+        def key_valid_changed(valid):
+            self.valid = valid
+
+        self.keys_widget.validChanged.connect(key_valid_changed)
+
+        self.layout().addWidget(self.keys_widget)
+        self.layout().addStretch()
+        self.layout().addWidget(self.warn_label)
 
     def apply(self):
-        text = self.slayout.get_text()
+        text = self.keys_widget.get_text()
         cosigner_data = self.wizard.current_cosigner(self.wizard_data)
         cosigner_data['master_key'] = text
 
@@ -905,14 +963,14 @@ class WCMultisig(WalletWizardComponent):
         m_label = QLabel()
         n_label = QLabel()
 
-        m_edit = QSlider(Qt.Horizontal, self)
+        m_edit = QSlider(Qt.Orientation.Horizontal, self)
         m_edit.setMinimum(1)
         m_edit.setMaximum(2)
         m_edit.setValue(2)
         m_edit.valueChanged.connect(on_m)
         on_m(m_edit.value())
 
-        n_edit = QSlider(Qt.Horizontal, self)
+        n_edit = QSlider(Qt.Orientation.Horizontal, self)
         n_edit.setMinimum(2)
         n_edit.setMaximum(15)
         n_edit.setValue(2)
@@ -952,27 +1010,22 @@ class WCImport(WalletWizardComponent):
         label = WWLabel(message)
         label.setMinimumWidth(400)
         header_layout.addWidget(label)
-        header_layout.addWidget(InfoButton(WIF_HELP_TEXT), alignment=Qt.AlignRight)
-
-        # TODO: KeysLayout assumes too much in parent, refactor KeysLayout
-        # for now, fake parent.next_button.setEnabled
-        class Hack:
-            def setEnabled(self2, b):
-                self.valid = b
-
-            def setToolTip(self2, b):
-                pass
-        self.next_button = Hack()
+        header_layout.addWidget(InfoButton(WIF_HELP_TEXT), alignment=Qt.AlignmentFlag.AlignRight)
 
         def is_valid(x) -> bool:
             return keystore.is_address_list(x) or keystore.is_private_key_list(x, raise_on_error=True)
 
-        self.slayout = KeysLayout(parent=self, header_layout=header_layout, is_valid=is_valid,
-                                  allow_multi=True, config=self.wizard.config)
-        self.layout().addLayout(self.slayout)
+        self.keys_widget = KeysWidget(header_layout=header_layout, is_valid=is_valid,
+                                      allow_multi=True, config=self.wizard.config)
+
+        def key_valid_changed(valid):
+            self.valid = valid
+
+        self.keys_widget.validChanged.connect(key_valid_changed)
+        self.layout().addWidget(self.keys_widget)
 
     def apply(self):
-        text = self.slayout.get_text()
+        text = self.keys_widget.get_text()
         if keystore.is_address_list(text):
             self.wizard_data['address_list'] = text
         elif keystore.is_private_key_list(text):
@@ -980,29 +1033,29 @@ class WCImport(WalletWizardComponent):
 
 
 class WCWalletPassword(WalletWizardComponent):
+
     def __init__(self, parent, wizard):
         WalletWizardComponent.__init__(self, parent, wizard, title=_('Wallet Password'))
-
         # TODO: PasswordLayout assumes a button, refactor PasswordLayout
         # for now, fake next_button.setEnabled
         class Hack:
             def setEnabled(self2, b):
                 self.valid = b
         self.next_button = Hack()
-
         self.pw_layout = PasswordLayout(
             msg=MSG_ENTER_PASSWORD,
             kind=PW_NEW,
             OK_button=self.next_button,
-            # force_disable_encrypt_cb=force_disable_encrypt_cb
         )
-        self.pw_layout.encrypt_cb.setChecked(True)
         self.layout().addLayout(self.pw_layout.layout())
         self.layout().addStretch(1)
 
+    def initialFocus(self) -> Optional[QWidget]:
+        return self.pw_layout.new_pw
+
     def apply(self):
         self.wizard_data['password'] = self.pw_layout.new_password()
-        self.wizard_data['encrypt'] = self.pw_layout.encrypt_cb.isChecked()
+        self.wizard_data['encrypt'] = True
 
 
 class SeedExtensionEdit(QWidget):
@@ -1058,17 +1111,17 @@ class CosignWidget(QWidget):
         self.update()
 
     def paintEvent(self, event):
-        bgcolor = self.palette().color(QPalette.Background)
-        pen = QPen(bgcolor, 7, Qt.SolidLine)
+        bgcolor = self.palette().color(QPalette.ColorRole.Window)
+        pen = QPen(bgcolor, 7, Qt.PenStyle.SolidLine)
         qp = QPainter()
         qp.begin(self)
         qp.setPen(pen)
-        qp.setRenderHint(QPainter.Antialiasing)
-        qp.setBrush(Qt.gray)
+        qp.setRenderHint(QPainter.RenderHint.Antialiasing)
+        qp.setBrush(Qt.GlobalColor.gray)
         for i in range(self.n):
             alpha = int(16 * 360 * i/self.n)
             alpha2 = int(16 * 360 * 1/self.n)
-            qp.setBrush(Qt.green if i < self.m else Qt.gray)
+            qp.setBrush(Qt.GlobalColor.green if i < self.m else Qt.GlobalColor.gray)
             qp.drawPie(self.R, alpha, alpha2)
         qp.end()
 
@@ -1083,6 +1136,7 @@ class WCChooseHWDevice(WalletWizardComponent, Logger):
         self.scanFailed.connect(self.on_scan_failed)
         self.scanComplete.connect(self.on_scan_complete)
         self.plugins = wizard.plugins
+        self.config = wizard.config
 
         self.error_l = WWLabel()
         self.error_l.setVisible(False)
@@ -1090,14 +1144,18 @@ class WCChooseHWDevice(WalletWizardComponent, Logger):
         self.device_list = QWidget()
         self.device_list_layout = QVBoxLayout()
         self.device_list.setLayout(self.device_list_layout)
-        self.choice_w = None
+        self.choice_w = None  # type: ChoiceWidget
 
         self.rescan_button = QPushButton(_('Rescan devices'))
         self.rescan_button.clicked.connect(self.on_rescan)
 
+        self.add_plugin_button = QPushButton(_('Add plugin'))
+        self.add_plugin_button.clicked.connect(self.on_add_plugin)
+
         hbox = QHBoxLayout()
         hbox.addStretch(1)
         hbox.addWidget(self.rescan_button)
+        hbox.addWidget(self.add_plugin_button)
         hbox.addStretch(1)
 
         self.layout().addWidget(self.error_l)
@@ -1112,6 +1170,11 @@ class WCChooseHWDevice(WalletWizardComponent, Logger):
     def on_rescan(self):
         self.scan_devices()
 
+    def on_add_plugin(self):
+        d = PluginsDialog(self.config, self.plugins)
+        d.exec()
+        self.scan_devices()
+
     def on_scan_failed(self, code, message):
         self.error_l.setText(message)
         self.error_l.setVisible(True)
@@ -1123,7 +1186,7 @@ class WCChooseHWDevice(WalletWizardComponent, Logger):
         self.error_l.setVisible(False)
         self.device_list.setVisible(True)
 
-        choices = []
+        choices = []  # type: List[ChoiceItem]
         for name, info in self.devices:
             state = _("initialized") if info.initialized else _("wiped")
             label = info.label or _("An unnamed {}").format(name)
@@ -1132,7 +1195,7 @@ class WCChooseHWDevice(WalletWizardComponent, Logger):
             except Exception:
                 transport_str = 'unknown transport'
             descr = f"{label} [{info.model_name or name}, {state}, {transport_str}]"
-            choices.append(((name, info), descr))
+            choices.append(ChoiceItem(key=(name, info), label=descr))
         msg = _('Select a device') + ':'
 
         if self.choice_w:
@@ -1231,29 +1294,44 @@ class WCChooseHWDevice(WalletWizardComponent, Logger):
     def apply(self):
         if self.choice_w:
             cosigner_data = self.wizard.current_cosigner(self.wizard_data)
-            cosigner_data['hardware_device'] = self.choice_w.selected_item[0]
+            cosigner_data['hardware_device'] = self.choice_w.selected_key
 
 
 class WCWalletPasswordHardware(WalletWizardComponent):
+
     def __init__(self, parent, wizard):
         WalletWizardComponent.__init__(self, parent, wizard, title=_('Encrypt using hardware'))
         self.plugins = wizard.plugins
-
-        self.playout = PasswordLayoutForHW(MSG_HW_STORAGE_ENCRYPTION)
-        self.playout.encrypt_cb.setChecked(True)
+        # TODO: PasswordLayout assumes a button, refactor PasswordLayout
+        # for now, fake next_button.setEnabled
+        class Hack:
+            def setEnabled(self2, b):
+                self.valid = b
+        self.next_button = Hack()
+        self.playout = PasswordLayoutForHW(
+            MSG_HW_STORAGE_ENCRYPTION,
+            kind=PW_NEW,
+            OK_button=self.next_button,
+        )
         self.layout().addLayout(self.playout.layout())
         self.layout().addStretch(1)
 
         self._valid = True
 
     def apply(self):
-        self.wizard_data['encrypt'] = self.playout.encrypt_cb.isChecked()
-        if self.playout.encrypt_cb.isChecked():
+        self.wizard_data['encrypt'] = True
+        if self.playout.should_encrypt_storage_with_xpub():
+            self.wizard_data['xpub_encrypt'] = True
             _name, _info = self.wizard_data['hardware_device']
             device_id = _info.device.id_
             client = self.plugins.device_manager.client_by_id(device_id, scan_now=False)
             # client.handler = self.plugin.create_handler(self.wizard)
+            # FIXME client can be None if it was recently disconnected.
+            #       also, even if not None, this might raise (e.g. if it disconnected *just now*):
             self.wizard_data['password'] = client.get_password_for_storage_encryption()
+        else:
+            self.wizard_data['xpub_encrypt'] = False
+            self.wizard_data['password'] = self.playout.new_password()
 
 
 class WCHWUnlock(WalletWizardComponent, Logger):
@@ -1265,9 +1343,15 @@ class WCHWUnlock(WalletWizardComponent, Logger):
         self._busy = True
         self.password = None
 
+        ok_icon = QLabel()
+        ok_icon.setPixmap(QPixmap(icon_path('confirmed.png')).scaledToWidth(48, mode=Qt.TransformationMode.SmoothTransformation))
+        ok_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.ok_l = WWLabel(_('Hardware successfully unlocked'))
-        self.ok_l.setAlignment(Qt.AlignCenter)
+        self.ok_l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.layout().addStretch(1)
+        self.layout().addWidget(ok_icon)
         self.layout().addWidget(self.ok_l)
+        self.layout().addStretch(1)
 
     def on_ready(self):
         _name, _info = self.wizard_data['hardware_device']
@@ -1276,6 +1360,11 @@ class WCHWUnlock(WalletWizardComponent, Logger):
 
         device_id = _info.device.id_
         client = self.plugins.device_manager.client_by_id(device_id, scan_now=False)
+        if client is None:
+            self.error = _("Client for hardware device was unpaired.")
+            self.busy = False
+            self.validate()
+            return
         client.handler = self.plugin.create_handler(self.wizard)
 
         def unlock_task(client):
@@ -1283,7 +1372,7 @@ class WCHWUnlock(WalletWizardComponent, Logger):
                 self.password = client.get_password_for_storage_encryption()
             except Exception as e:
                 self.error = repr(e)  # TODO: handle user interaction exceptions (e.g. invalid pin) more gracefully
-                self.logger.error(repr(e))
+                self.logger.exception(repr(e))
             self.busy = False
             self.validate()
 
@@ -1333,9 +1422,15 @@ class WCHWXPub(WalletWizardComponent, Logger):
         self.label = None
         self.soft_device_id = None
 
+        ok_icon = QLabel()
+        ok_icon.setPixmap(QPixmap(icon_path('confirmed.png')).scaledToWidth(48, mode=Qt.TransformationMode.SmoothTransformation))
+        ok_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.ok_l = WWLabel(_('Hardware keystore added to wallet'))
-        self.ok_l.setAlignment(Qt.AlignCenter)
+        self.ok_l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.layout().addStretch(1)
+        self.layout().addWidget(ok_icon)
         self.layout().addWidget(self.ok_l)
+        self.layout().addStretch(1)
 
     def on_ready(self):
         cosigner_data = self.wizard.current_cosigner(self.wizard_data)
@@ -1345,6 +1440,11 @@ class WCHWXPub(WalletWizardComponent, Logger):
 
         device_id = _info.device.id_
         client = self.plugins.device_manager.client_by_id(device_id, scan_now=False)
+        if client is None:
+            self.error = _("Client for hardware device was unpaired.")
+            self.busy = False
+            self.validate()
+            return
         if not client.handler:
             client.handler = self.plugin.create_handler(self.wizard)
 
@@ -1362,7 +1462,7 @@ class WCHWXPub(WalletWizardComponent, Logger):
                 self.logger.error(repr(e))
             except Exception as e:
                 self.error = repr(e)  # TODO: handle user interaction exceptions (e.g. invalid pin) more gracefully
-                self.logger.error(repr(e))
+                self.logger.exception(repr(e))
             self.logger.debug(f'Done retrieve xpub: {self.xpub}')
             self.busy = False
             self.validate()
@@ -1410,6 +1510,15 @@ class WCHWUninitialized(WalletWizardComponent):
     def on_ready(self):
         cosigner_data = self.wizard.current_cosigner(self.wizard_data)
         _name, _info = cosigner_data['hardware_device']
+        w_icon = QLabel()
+        w_icon.setPixmap(QPixmap(icon_path('warning.png')).scaledToWidth(48, mode=Qt.TransformationMode.SmoothTransformation))
+        w_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label = WWLabel(_('This {} is not initialized. Use manufacturer tooling to initialize the device.').format(_info.model_name))
-        label.setAlignment(Qt.AlignCenter)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.layout().addStretch(1)
+        self.layout().addWidget(w_icon)
         self.layout().addWidget(label)
+        self.layout().addStretch(1)
+
+    def apply(self):
+        pass

@@ -24,11 +24,11 @@
 # SOFTWARE.
 from collections import defaultdict
 from math import floor, log10
-from typing import NamedTuple, List, Callable, Sequence, Union, Dict, Tuple, Mapping, Type, TYPE_CHECKING
+from typing import NamedTuple, List, Callable, Sequence, Dict, Tuple, Mapping, Type, TYPE_CHECKING
 from decimal import Decimal
 
 from .bitcoin import sha256, COIN, is_address
-from .transaction import Transaction, TxOutput, PartialTransaction, PartialTxInput, PartialTxOutput
+from .transaction import Transaction, PartialTransaction, PartialTxInput, PartialTxOutput
 from .util import NotEnoughFunds
 from .logging import Logger
 
@@ -160,7 +160,7 @@ class CoinChooserBase(Logger):
         # Break change up if bigger than max_change
         output_amounts = [o.value for o in tx.outputs()]
         # Don't split change of less than 0.02 BTC
-        max_change = max(max(output_amounts) * 1.25, 0.02 * COIN)
+        max_change = max([0.02 * COIN] + output_amounts) * 1.25
 
         # Use N change outputs
         for n in range(1, count + 1):
@@ -176,8 +176,8 @@ class CoinChooserBase(Logger):
             return len(s) - len(s.rstrip('0'))
 
         zeroes = [trailing_zeroes(i) for i in output_amounts]
-        min_zeroes = min(zeroes)
-        max_zeroes = max(zeroes)
+        min_zeroes = min([8] + zeroes)
+        max_zeroes = max([0] + zeroes)
 
         if n > 1:
             zeroes = range(max(0, min_zeroes - 1), (max_zeroes + 1) + 1)
@@ -201,7 +201,10 @@ class CoinChooserBase(Logger):
         # Last change output.  Round down to maximum precision but lose
         # no more than 10**max_dp_to_round_for_privacy
         # e.g. a max of 2 decimal places means losing 100 satoshis to fees
-        max_dp_to_round_for_privacy = 2 if self.enable_output_value_rounding else 0
+        # don't round if the fee estimator is set to 0 fixed fee, so a 0 fee tx remains a 0 fee tx
+        is_zero_fee_tx = True if fee_estimator_numchange(1) == 0 else False
+        output_value_rounding = self.enable_output_value_rounding and not is_zero_fee_tx
+        max_dp_to_round_for_privacy = 2 if output_value_rounding else 0
         N = int(pow(10, min(max_dp_to_round_for_privacy, zeroes[0])))
         amount = (remaining // N) * N
         amounts.append(amount)
@@ -225,14 +228,17 @@ class CoinChooserBase(Logger):
             c.is_change = True
         return change
 
-    def _construct_tx_from_selected_buckets(self, *, buckets: Sequence[Bucket],
-                                            base_tx: PartialTransaction, change_addrs,
-                                            fee_estimator_w, dust_threshold,
-                                            base_weight) -> Tuple[PartialTransaction, List[PartialTxOutput]]:
+    def _construct_tx_from_selected_buckets(
+            self, *, buckets: Sequence[Bucket],
+            base_tx: PartialTransaction, change_addrs,
+            fee_estimator_w, dust_threshold,
+            base_weight,
+            BIP69_sort: bool,
+    ) -> Tuple[PartialTransaction, List[PartialTxOutput]]:
         # make a copy of base_tx so it won't get mutated
-        tx = PartialTransaction.from_io(base_tx.inputs()[:], base_tx.outputs()[:])
+        tx = PartialTransaction.from_io(base_tx.inputs()[:], base_tx.outputs()[:], BIP69_sort=BIP69_sort)
 
-        tx.add_inputs([coin for b in buckets for coin in b.coins])
+        tx.add_inputs([coin for b in buckets for coin in b.coins], BIP69_sort=BIP69_sort)
         tx_weight = self._get_tx_weight(buckets, base_weight=base_weight)
 
         # change is sent back to sending address unless specified
@@ -246,7 +252,7 @@ class CoinChooserBase(Logger):
         output_weight = 4 * Transaction.estimated_output_size_for_address(change_addrs[0])
         fee_estimator_numchange = lambda count: fee_estimator_w(tx_weight + count * output_weight)
         change = self._change_outputs(tx, change_addrs, fee_estimator_numchange, dust_threshold)
-        tx.add_outputs(change)
+        tx.add_outputs(change, BIP69_sort=BIP69_sort)
 
         return tx, change
 
@@ -270,9 +276,16 @@ class CoinChooserBase(Logger):
 
         return total_weight
 
-    def make_tx(self, *, coins: Sequence[PartialTxInput], inputs: List[PartialTxInput],
-                outputs: List[PartialTxOutput], change_addrs: Sequence[str],
-                fee_estimator_vb: Callable, dust_threshold: int) -> PartialTransaction:
+    def make_tx(
+            self, *,
+            coins: Sequence[PartialTxInput],
+            inputs: List[PartialTxInput],
+            outputs: List[PartialTxOutput],
+            change_addrs: Sequence[str],
+            fee_estimator_vb: Callable,
+            dust_threshold: int,
+            BIP69_sort: bool = True,
+    ) -> PartialTransaction:
         """Select unspent coins to spend to pay outputs.  If the change is
         greater than dust_threshold (after adding the change output to
         the transaction) it is kept, otherwise none is sent and it is
@@ -284,14 +297,15 @@ class CoinChooserBase(Logger):
 
         Note: fee_estimator_vb expects virtual bytes
         """
-        assert outputs, 'tx outputs cannot be empty'
-
         # Deterministic randomness from coins
         utxos = [c.prevout.serialize_to_network() for c in coins]
         self.p = PRNG(b''.join(sorted(utxos)))
 
+        assert len(outputs) > 0 or len(change_addrs) == 1, \
+            "sweeps with 0 outputs should not use multiple change addresses"
+
         # Copy the outputs so when adding change we don't modify "outputs"
-        base_tx = PartialTransaction.from_io(inputs[:], outputs[:])
+        base_tx = PartialTransaction.from_io(inputs[:], outputs[:], BIP69_sort=BIP69_sort)
         input_value = base_tx.input_value()
 
         # Weight of the transaction with no inputs and no change
@@ -300,7 +314,10 @@ class CoinChooserBase(Logger):
         # marker and flag are excluded, which is compensated in get_tx_weight()
         # FIXME calculation will be off by this (2 wu) in case of RBF batching
         base_weight = base_tx.estimated_weight()
-        spent_amount = base_tx.output_value()
+        # by setting spent_amount = dust_threshold if there are no outputs we ensure that
+        # enough inputs are added so there is always at least a change output created
+        # as txs have to have at least 1 output according to consensus rules
+        spent_amount = base_tx.output_value() if outputs else dust_threshold
 
         def fee_estimator_w(weight):
             return fee_estimator_vb(Transaction.virtual_size_from_weight(weight))
@@ -322,13 +339,15 @@ class CoinChooserBase(Logger):
             return total_input >= spent_amount + fee_estimator_w(total_weight)
 
         def tx_from_buckets(buckets):
-            return self._construct_tx_from_selected_buckets(buckets=buckets,
-                                                            base_tx=base_tx,
-                                                            change_addrs=change_addrs,
-                                                            fee_estimator_w=fee_estimator_w,
-                                                            dust_threshold=dust_threshold,
-                                                            base_weight=base_weight)
-
+            return self._construct_tx_from_selected_buckets(
+                buckets=buckets,
+                base_tx=base_tx,
+                change_addrs=change_addrs,
+                fee_estimator_w=fee_estimator_w,
+                dust_threshold=dust_threshold,
+                base_weight=base_weight,
+                BIP69_sort=BIP69_sort,
+            )
         # Collect the coins into buckets
         all_buckets = self.bucketize_coins(coins, fee_estimator_vb=fee_estimator_vb)
         # Filter some buckets out. Only keep those that have positive effective value.
@@ -460,8 +479,12 @@ class CoinChooserPrivacy(CoinChooserRandom):
         return [coin.scriptpubkey.hex() for coin in coins]
 
     def penalty_func(self, base_tx, *, tx_from_buckets):
-        min_change = min(o.value for o in base_tx.outputs()) * 0.75
-        max_change = max(o.value for o in base_tx.outputs()) * 1.33
+        if _outputs := base_tx.outputs():
+            min_change = min(o.value for o in _outputs) * 0.75
+            max_change = max(o.value for o in _outputs) * 1.33
+        else:
+            min_change = 0
+            max_change = 0.02 * COIN
 
         def penalty(buckets: List[Bucket]) -> ScoredCandidate:
             # Penalize using many buckets (~inputs)
@@ -489,11 +512,13 @@ COIN_CHOOSERS = {
     'Privacy': CoinChooserPrivacy,
 }  # type: Mapping[str, Type[CoinChooserBase]]
 
+
 def get_name(config: 'SimpleConfig') -> str:
     kind = config.WALLET_COIN_CHOOSER_POLICY
     if kind not in COIN_CHOOSERS:
         kind = config.cv.WALLET_COIN_CHOOSER_POLICY.get_default_value()
     return kind
+
 
 def get_coin_chooser(config: 'SimpleConfig') -> CoinChooserBase:
     klass = COIN_CHOOSERS[get_name(config)]

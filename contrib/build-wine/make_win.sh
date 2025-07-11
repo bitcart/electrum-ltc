@@ -6,7 +6,7 @@ here="$(dirname "$(readlink -e "$0")")"
 test -n "$here" -a -d "$here" || exit
 
 if [ -z "$WIN_ARCH" ] ; then
-    export WIN_ARCH="win32"  # default
+    export WIN_ARCH="win64"  # default
 fi
 if [ "$WIN_ARCH" = "win32" ] ; then
     export GCC_TRIPLET_HOST="i686-w64-mingw32"
@@ -43,7 +43,7 @@ rm "$here"/dist/* -rf
 
 mkdir -p "$CACHEDIR" "$DLL_TARGET_DIR" "$PIP_CACHE_DIR"
 
-if [ -f "$DLL_TARGET_DIR/libsecp256k1-2.dll" ]; then
+if ls "$DLL_TARGET_DIR"/libsecp256k1-*.dll 1> /dev/null 2>&1; then
     info "libsecp256k1 already built, skipping"
 else
     "$CONTRIB"/make_libsecp256k1.sh || fail "Could not build libsecp"

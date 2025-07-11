@@ -231,6 +231,42 @@ Pane {
                         }
                     }
 
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        spacing: 0
+                        Switch {
+                            id: psbtNostr
+                            onCheckedChanged: {
+                                if (activeFocus)
+                                    AppController.setPluginEnabled('psbt_nostr', checked)
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Nostr Cosigner')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        spacing: 0
+                        Switch {
+                            id: setMaxBrightnessOnQrDisplay
+                            onCheckedChanged: {
+                                if (activeFocus)
+                                    Config.setMaxBrightnessOnQrDisplay = checked
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Set display to max brightness when displaying QR codes')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
                     PrefsHeading {
                         Layout.columnSpan: 2
                         text: qsTr('Wallet behavior')
@@ -253,9 +289,62 @@ Pane {
                         }
                     }
 
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        spacing: 0
+                        Switch {
+                            id: freezeReusedAddressUtxos
+                            onCheckedChanged: {
+                                if (activeFocus)
+                                    Config.freezeReusedAddressUtxos = checked
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: Config.shortDescFor('WALLET_FREEZE_REUSED_ADDRESS_UTXOS')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
                     PrefsHeading {
                         Layout.columnSpan: 2
                         text: qsTr('Lightning')
+                    }
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: Config.shortDescFor('LIGHTNING_PAYMENT_FEE_MAX_MILLIONTHS')
+                        wrapMode: Text.Wrap
+                    }
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: qsTr('<b>%1%</b> of payment').arg(maxfeeslider._fees[maxfeeslider.value]/10000)
+                        wrapMode: Text.Wrap
+                    }
+
+                    Slider {
+                        id: maxfeeslider
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        Layout.leftMargin: constants.paddingXLarge
+                        Layout.rightMargin: constants.paddingXLarge
+
+                        property var _fees: [500, 1000, 3000, 5000, 10000, 20000, 30000, 50000]
+
+                        snapMode: Slider.SnapOnRelease
+                        stepSize: 1
+                        from: 0
+                        to: _fees.length - 1
+
+                        onValueChanged: {
+                            if (activeFocus)
+                                Config.lightningPaymentFeeMaxMillionths = _fees[value]
+                        }
+
+                        Component.onCompleted: {
+                            value = _fees.indexOf(Config.lightningPaymentFeeMaxMillionths)
+                        }
                     }
 
                     RowLayout {
@@ -327,24 +416,6 @@ Pane {
                         }
                     }
 
-                    RowLayout {
-                        Layout.columnSpan: 2
-                        Layout.fillWidth: true
-                        spacing: 0
-                        Switch {
-                            id: useFallbackAddress
-                            onCheckedChanged: {
-                                if (activeFocus)
-                                    Config.useFallbackAddress = checked
-                            }
-                        }
-                        Label {
-                            Layout.fillWidth: true
-                            text: qsTr('Create lightning invoices with on-chain fallback address')
-                            wrapMode: Text.Wrap
-                        }
-                    }
-
                     PrefsHeading {
                         Layout.columnSpan: 2
                         text: qsTr('Advanced')
@@ -387,10 +458,8 @@ Pane {
                         }
                     }
                 }
-
             }
         }
-
     }
 
     Component {
@@ -407,11 +476,13 @@ Pane {
         rateSources.currentIndex = rateSources.indexOfValue(Daemon.fx.rateSource)
         fiatEnable.checked = Daemon.fx.enabled
         spendUnconfirmed.checked = Config.spendUnconfirmed
+        freezeReusedAddressUtxos.checked = Config.freezeReusedAddressUtxos
         useTrampolineRouting.checked = !Config.useGossip
-        useFallbackAddress.checked = Config.useFallbackAddress
         enableDebugLogs.checked = Config.enableDebugLogs
         alwaysAllowScreenshots.checked = Config.alwaysAllowScreenshots
+        setMaxBrightnessOnQrDisplay.checked = Config.setMaxBrightnessOnQrDisplay
         useRecoverableChannels.checked = Config.useRecoverableChannels
         syncLabels.checked = AppController.isPluginEnabled('labels')
+        psbtNostr.checked = AppController.isPluginEnabled('psbt_nostr')
     }
 }
