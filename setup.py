@@ -63,7 +63,7 @@ setup(
     extras_require=extras_require,
     packages=(['electrum_ltc',]
               + [('electrum_ltc.'+pkg) for pkg in
-                 find_packages('electrum', exclude=["tests"])]),
+                 find_packages('electrum_ltc', exclude=["tests"])]),
     package_dir={
         'electrum_ltc': 'electrum'
     },
