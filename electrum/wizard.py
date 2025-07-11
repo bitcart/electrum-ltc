@@ -3,26 +3,26 @@ import os
 
 from typing import List, NamedTuple, Any, Dict, Optional, Tuple, TYPE_CHECKING
 
-from electrum.gui.messages import TERMS_OF_USE_LATEST_VERSION
+from electrum_ltc.gui.messages import TERMS_OF_USE_LATEST_VERSION
 
-from electrum.i18n import _
-from electrum.interface import ServerAddr
-from electrum.keystore import hardware_keystore
-from electrum.logging import get_logger
-from electrum.network import ProxySettings
-from electrum.plugin import run_hook
-from electrum.slip39 import EncryptedSeed
-from electrum.storage import WalletStorage, StorageEncryptionVersion
-from electrum.wallet_db import WalletDB
-from electrum.bip32 import normalize_bip32_derivation, xpub_type
-from electrum import keystore, mnemonic, bitcoin
-from electrum.mnemonic import is_any_2fa_seed_type, can_seed_have_passphrase
+from electrum_ltc.i18n import _
+from electrum_ltc.interface import ServerAddr
+from electrum_ltc.keystore import hardware_keystore
+from electrum_ltc.logging import get_logger
+from electrum_ltc.network import ProxySettings
+from electrum_ltc.plugin import run_hook
+from electrum_ltc.slip39 import EncryptedSeed
+from electrum_ltc.storage import WalletStorage, StorageEncryptionVersion
+from electrum_ltc.wallet_db import WalletDB
+from electrum_ltc.bip32 import normalize_bip32_derivation, xpub_type
+from electrum_ltc import keystore, mnemonic, bitcoin
+from electrum_ltc.mnemonic import is_any_2fa_seed_type, can_seed_have_passphrase
 
 if TYPE_CHECKING:
-    from electrum.daemon import Daemon
-    from electrum.plugin import Plugins
-    from electrum.keystore import Hardware_KeyStore
-    from electrum.simple_config import SimpleConfig
+    from electrum_ltc.daemon import Daemon
+    from electrum_ltc.plugin import Plugins
+    from electrum_ltc.keystore import Hardware_KeyStore
+    from electrum_ltc.simple_config import SimpleConfig
 
 
 class WizardViewState(NamedTuple):

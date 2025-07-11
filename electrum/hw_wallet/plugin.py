@@ -25,20 +25,20 @@
 from abc import abstractmethod, ABC
 from typing import TYPE_CHECKING, Sequence, Optional, Type, Iterable, Any
 
-from electrum.plugin import (BasePlugin, hook, Device, DeviceMgr,
+from electrum_ltc.plugin import (BasePlugin, hook, Device, DeviceMgr,
                              assert_runs_in_hwd_thread, runs_in_hwd_thread)
-from electrum.i18n import _
-from electrum.bitcoin import is_address, opcodes
-from electrum.util import versiontuple, UserFacingException, ChoiceItem
-from electrum.transaction import TxOutput, PartialTransaction
-from electrum.bip32 import BIP32Node
-from electrum.storage import get_derivation_used_for_hw_device_encryption
-from electrum.keystore import Xpub, Hardware_KeyStore
+from electrum_ltc.i18n import _
+from electrum_ltc.bitcoin import is_address, opcodes
+from electrum_ltc.util import versiontuple, UserFacingException, ChoiceItem
+from electrum_ltc.transaction import TxOutput, PartialTransaction
+from electrum_ltc.bip32 import BIP32Node
+from electrum_ltc.storage import get_derivation_used_for_hw_device_encryption
+from electrum_ltc.keystore import Xpub, Hardware_KeyStore
 
 if TYPE_CHECKING:
     import threading
-    from electrum.plugin import DeviceInfo
-    from electrum.wallet import Abstract_Wallet
+    from electrum_ltc.plugin import DeviceInfo
+    from electrum_ltc.wallet import Abstract_Wallet
 
 
 class HW_PluginBase(BasePlugin, ABC):
